@@ -1096,6 +1096,25 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
 
+        // draft() advances the drafter KV through the speculative suffix. The
+        // next target batch starts at that suffix's first position, where the
+        // target-conditioned encoder output must replace the speculative KV.
+        // Without this rewind the batch allocator sees, for example, stored
+        // position 61 followed by an injection beginning at 56 and rejects the
+        // otherwise valid batch as non-consecutive.
+        auto * mem_dft = llama_get_memory(ctx_dft);
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            if (i_batch_beg[seq_id] < 0) {
+                continue;
+            }
+            const llama_pos p0 = batch_in.pos[i_batch_beg[seq_id]];
+            if (!llama_memory_seq_rm(mem_dft, seq_id, p0, -1)) {
+                LOG_ERR("%s: failed to discard stale draft KV for seq_id=%d at pos=%d\n",
+                        __func__, (int) seq_id, (int) p0);
+                return false;
+            }
+        }
+
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
