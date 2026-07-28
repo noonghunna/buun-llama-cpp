@@ -15,6 +15,7 @@ This fork stages MoE-expert-cache work on top of `spiritbuun/buun-llama-cpp`. Th
 6. **No internal rig paths, hostnames, or usernames** in committed files or issues. Use `<models>/`-style placeholders.
 7. **Build etiquette:** your compiles share CPU with measured benches on the same rig. Batch compiles; a stray parallel build has silently cost a bench −22% before.
 8. **Results go to issues**, not local notes: completion comments carry branch + commit + owed device run; measurements that gate merges are posted on the ticket they gate.
+9. **Never close an issue on authoring alone.** Closure follows the issue's acceptance criteria being fully met — for most issues that means device-validation numbers, posted in the closing comment by whoever ran them. Doc-only issues may close on merge. When your authoring completes, comment and leave the issue open.
 
 ## Sync execution (when explicitly asked to assist a sync)
 
