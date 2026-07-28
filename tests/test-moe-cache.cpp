@@ -30,6 +30,15 @@ constexpr int64_t dflash_route_ids = dflash_top_k * dflash_batch;
 static_assert(dflash_route_ids <= GGML_MOE_CACHE_MAX_TOPK,
         "DFlash draft+1 route must fit the MoE cache ceiling");
 
+constexpr int64_t integrity_n_expert = 256;
+constexpr int64_t integrity_top_k    = 10;
+constexpr int64_t integrity_tokens   = 16;
+constexpr int64_t integrity_routes   = integrity_top_k * integrity_tokens;
+constexpr int64_t integrity_n_in     = 64;
+constexpr int64_t integrity_n_out    = 33;
+static_assert(integrity_routes <= GGML_MOE_CACHE_MAX_TOPK,
+        "integrity route must exercise the fused cache path");
+
 constexpr int64_t prefill_n_in     = 32;
 constexpr int64_t prefill_n_out    = 8;
 constexpr int64_t prefill_n_expert = 4;
@@ -208,6 +217,39 @@ static bool compare_output(
     return squared_error / std::max(squared_reference, 1e-12) <= max_nmse;
 }
 
+static bool run_pair_residency_contract() {
+    const ggml_init_params params = {
+        5 * ggml_tensor_overhead(),
+        nullptr,
+        true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        fprintf(stderr, "fused-residency-contract: failed to create context\n");
+        return false;
+    }
+
+    ggml_tensor * weights0 = ggml_new_tensor_3d(
+            ctx, GGML_TYPE_Q4_0, n_in, n_out, integrity_n_expert);
+    ggml_tensor * weights1 = ggml_new_tensor_3d(
+            ctx, GGML_TYPE_Q4_0, n_in, n_out, integrity_n_expert);
+    ggml_tensor * activations = ggml_new_tensor_3d(
+            ctx, GGML_TYPE_F32, n_in, 1, integrity_tokens);
+    ggml_tensor * ids = ggml_new_tensor_2d(
+            ctx, GGML_TYPE_I32, integrity_top_k, integrity_tokens);
+
+    // Unallocated tensors deliberately have no host residency. A paired node
+    // must not be constructed until both expert tensors are known host-side:
+    // CUDA's ordinary MUL_MAT_ID implementation accepts the reused op marker
+    // but does not implement src[3].
+    ggml_tensor * pair =
+        ggml_mul_mat_id_pair(ctx, weights0, weights1, activations, ids);
+    const bool ok = pair == nullptr;
+    ggml_free(ctx);
+    printf("fused-residency-contract: %s\n", ok ? "OK" : "FAIL");
+    return ok;
+}
+
 static void configure_cache(const char * fail_stage, int max_batch = 1) {
     set_env("GGML_CUDA_MOE_CACHE", "1");
     set_env("GGML_CUDA_MOE_CACHE_MODE", "on");
@@ -290,6 +332,194 @@ static void free_graph(test_graph & graph) {
         ggml_free(graph.ctx);
     }
     graph = {};
+}
+
+static std::vector<int32_t> make_integrity_routes() {
+    // Six statistically hot choices plus four rotating tail choices per token.
+    // This approximates a Zipf-like top-10 route while remaining deterministic.
+    static const int32_t hot[] = {
+        3, 7, 11, 18, 23, 29, 37, 41,
+        46, 52, 61, 67, 71, 79, 83, 89,
+    };
+    std::vector<int32_t> ids(integrity_routes);
+    for (int64_t token = 0; token < integrity_tokens; token++) {
+        for (int64_t rank = 0; rank < integrity_top_k; rank++) {
+            int32_t expert;
+            if (rank < 6) {
+                expert = hot[(rank + token % 4) % (int64_t)(sizeof(hot) / sizeof(hot[0]))];
+            } else {
+                expert = 96 + (int32_t)((token * 17 + (rank - 6) * 47) % 160);
+            }
+            ids[token * integrity_top_k + rank] = expert;
+        }
+    }
+    return ids;
+}
+
+static bool integrity_route_spread_ok(const std::vector<int32_t> & ids) {
+    std::vector<int> counts(integrity_n_expert, 0);
+    for (int32_t expert : ids) {
+        if (expert < 0 || expert >= integrity_n_expert) {
+            return false;
+        }
+        counts[expert]++;
+    }
+    int used = 0;
+    int minimum = integrity_routes;
+    int maximum = 0;
+    for (int count : counts) {
+        if (count == 0) {
+            continue;
+        }
+        used++;
+        minimum = std::min(minimum, count);
+        maximum = std::max(maximum, count);
+    }
+    return used >= 56 && maximum >= 6 && maximum >= 3 * minimum;
+}
+
+static int count_distinct_slot_signatures(
+        const std::vector<float> & packed, int pair) {
+    std::vector<double> signatures;
+    signatures.reserve(integrity_routes);
+    const int64_t packed_row = 2 * integrity_n_out;
+    for (int64_t route = 0; route < integrity_routes; route++) {
+        const float * row = packed.data() + route * packed_row + pair * integrity_n_out;
+        double signature = 0.0;
+        double energy = 0.0;
+        for (int64_t col = 0; col < integrity_n_out; col++) {
+            signature += (col + 1) * (double)row[col];
+            energy += (double)row[col] * row[col];
+        }
+        if (!std::isfinite(signature) || energy < 1e-10) {
+            return 0;
+        }
+        bool distinct = true;
+        for (double previous : signatures) {
+            if (std::abs(previous - signature) < 1e-5) {
+                distinct = false;
+                break;
+            }
+        }
+        if (distinct) {
+            signatures.push_back(signature);
+        }
+    }
+    return (int)signatures.size();
+}
+
+static bool run_pair_output_integrity(ggml_backend_t cpu) {
+    const ggml_init_params params = {
+        4 * ggml_tensor_overhead(),
+        nullptr,
+        true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        return false;
+    }
+    ggml_tensor * weights0 = ggml_new_tensor_3d(
+            ctx, GGML_TYPE_F32, integrity_n_in, integrity_n_out, integrity_n_expert);
+    ggml_tensor * weights1 = ggml_new_tensor_3d(
+            ctx, GGML_TYPE_F32, integrity_n_in, integrity_n_out, integrity_n_expert);
+    ggml_tensor * ids = ggml_new_tensor_2d(
+            ctx, GGML_TYPE_I32, integrity_top_k, integrity_tokens);
+    ggml_tensor * activations = ggml_new_tensor_3d(
+            ctx, GGML_TYPE_F32, integrity_n_in, 1, integrity_tokens);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, cpu);
+    if (!buffer) {
+        ggml_free(ctx);
+        return false;
+    }
+    ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    std::vector<float> w0(ggml_nelements(weights0));
+    std::vector<float> w1(ggml_nelements(weights1));
+    for (size_t index = 0; index < w0.size(); index++) {
+        w0[index] = 0.09f * std::sin((float)(index % 1009) * 0.017f) +
+                    0.03f * std::cos((float)(index % 421) * 0.031f);
+        w1[index] = -0.07f * std::sin((float)(index % 997) * 0.023f) +
+                     0.05f * std::cos((float)(index % 389) * 0.037f);
+    }
+    const std::vector<int32_t> ids_data = make_integrity_routes();
+    std::vector<float> activation_data(ggml_nelements(activations));
+    for (size_t index = 0; index < activation_data.size(); index++) {
+        activation_data[index] = 0.31f * std::sin((float)index * 0.059f) -
+                                 0.19f * std::cos((float)index * 0.097f);
+    }
+    ggml_backend_tensor_set(weights0, w0.data(), 0, w0.size() * sizeof(float));
+    ggml_backend_tensor_set(weights1, w1.data(), 0, w1.size() * sizeof(float));
+    ggml_backend_tensor_set(ids, ids_data.data(), 0, ids_data.size() * sizeof(int32_t));
+    ggml_backend_tensor_set(activations, activation_data.data(), 0,
+                            activation_data.size() * sizeof(float));
+
+    test_graph paired = make_pair_graph(cpu, weights0, weights1, activations, ids);
+    test_graph separate0 = make_graph(cpu, weights0, activations, ids);
+    test_graph separate1 = make_graph(cpu, weights1, activations, ids);
+    const bool setup_ok = paired.ctx && paired.buffer && separate0.ctx && separate0.buffer &&
+                          separate1.ctx && separate1.buffer;
+    const bool route_spread_ok = integrity_route_spread_ok(ids_data);
+    set_env("GGML_CUDA_MOE_CACHE", "0");
+    const bool compute_ok = setup_ok &&
+        ggml_backend_graph_compute(cpu, paired.graph) == GGML_STATUS_SUCCESS &&
+        ggml_backend_graph_compute(cpu, separate0.graph) == GGML_STATUS_SUCCESS &&
+        ggml_backend_graph_compute(cpu, separate1.graph) == GGML_STATUS_SUCCESS;
+    bool reference_ok = false;
+    bool reference0_ok = false;
+    bool reference1_ok = false;
+    int distinct0 = 0;
+    int distinct1 = 0;
+    bool ok = route_spread_ok && compute_ok;
+
+    std::vector<float> actual(2 * integrity_routes * integrity_n_out);
+    std::vector<float> out0(integrity_routes * integrity_n_out);
+    std::vector<float> out1(integrity_routes * integrity_n_out);
+    std::vector<float> reference(actual.size());
+    std::vector<float> actual0(out0.size());
+    std::vector<float> actual1(out1.size());
+    if (ok) {
+        ggml_backend_tensor_get(paired.out, actual.data(), 0, actual.size() * sizeof(float));
+        ggml_backend_tensor_get(separate0.out, out0.data(), 0, out0.size() * sizeof(float));
+        ggml_backend_tensor_get(separate1.out, out1.data(), 0, out1.size() * sizeof(float));
+        for (int64_t route = 0; route < integrity_routes; route++) {
+            memcpy(reference.data() + route * 2 * integrity_n_out,
+                   out0.data() + route * integrity_n_out,
+                   integrity_n_out * sizeof(float));
+            memcpy(reference.data() + route * 2 * integrity_n_out + integrity_n_out,
+                   out1.data() + route * integrity_n_out,
+                   integrity_n_out * sizeof(float));
+        }
+        for (int64_t route = 0; route < integrity_routes; route++) {
+            memcpy(actual0.data() + route * integrity_n_out,
+                   actual.data() + route * 2 * integrity_n_out,
+                   integrity_n_out * sizeof(float));
+            memcpy(actual1.data() + route * integrity_n_out,
+                   actual.data() + route * 2 * integrity_n_out + integrity_n_out,
+                   integrity_n_out * sizeof(float));
+        }
+        reference0_ok = compare_output(out0, actual0, 1e-10);
+        reference1_ok = compare_output(out1, actual1, 1e-10);
+
+        reference_ok = compare_output(reference, actual, 1e-10);
+        distinct0 = count_distinct_slot_signatures(actual, 0);
+        distinct1 = count_distinct_slot_signatures(actual, 1);
+        ok = reference_ok && distinct0 >= integrity_routes / 2 &&
+             distinct1 >= integrity_routes / 2;
+    }
+
+    free_graph(separate1);
+    free_graph(separate0);
+    free_graph(paired);
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    printf("fused-output-integrity-10x16x256: %s\n", ok ? "OK" : "FAIL");
+    if (!ok) {
+        fprintf(stderr, "fused-output-integrity-10x16x256: setup=%d route-spread=%d "
+                "compute=%d reference=%d (%d/%d) distinct=%d/%d\n",
+                setup_ok, route_spread_ok, compute_ok, reference_ok,
+                reference0_ok, reference1_ok, distinct0, distinct1);
+    }
+    return ok;
 }
 
 static bool run_scenario(
@@ -1358,15 +1588,30 @@ int main() {
     ggml_log_set(log_callback, &capture);
 
     ggml_backend_dev_t cuda_device = find_cuda_device();
+    ggml_backend_t cpu = init_cpu_backend();
+    const bool residency_contract_ok = run_pair_residency_contract();
+    const bool output_integrity_ok = cpu && run_pair_output_integrity(cpu);
     if (!cuda_device) {
         printf("SKIP: CUDA backend unavailable\n");
-        return 0;
+        if (cpu) {
+            ggml_backend_free(cpu);
+        }
+        return residency_contract_ok && output_integrity_ok ? 0 : 1;
+    }
+    if (!residency_contract_ok || !output_integrity_ok) {
+        fprintf(stderr, "test-moe-cache: FAIL cases=%s%s%s\n",
+                residency_contract_ok ? "" : "fused-residency-contract",
+                !residency_contract_ok && !output_integrity_ok ? "," : "",
+                output_integrity_ok ? "" : "fused-output-integrity-10x16x256");
+        if (cpu) {
+            ggml_backend_free(cpu);
+        }
+        return 1;
     }
     ggml_backend_reg_t cuda_reg =
         ggml_backend_dev_backend_reg(cuda_device);
 
     ggml_backend_t cuda = ggml_backend_dev_init(cuda_device, nullptr);
-    ggml_backend_t cpu = init_cpu_backend();
     if (!cuda || !cpu) {
         fprintf(stderr, "test-moe-cache-setup: failed to initialize CUDA and CPU backends\n");
         if (cuda) {
