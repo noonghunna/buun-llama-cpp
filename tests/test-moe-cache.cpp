@@ -241,6 +241,31 @@ static test_graph make_graph(
     return result;
 }
 
+static test_graph make_pair_graph(
+        ggml_backend_t cpu,
+        ggml_tensor * weights0,
+        ggml_tensor * weights1,
+        ggml_tensor * activations,
+        ggml_tensor * ids) {
+    ggml_init_params params = {
+        8 * ggml_tensor_overhead() + ggml_graph_overhead(),
+        nullptr,
+        true,
+    };
+    test_graph result;
+    result.ctx = ggml_init(params);
+    if (!result.ctx) {
+        return result;
+    }
+    result.out = ggml_mul_mat_id_pair(
+            result.ctx, weights0, weights1, activations, ids);
+    ggml_set_name(result.out, "moe_cache_pair_test_out");
+    result.graph = ggml_new_graph(result.ctx);
+    ggml_build_forward_expand(result.graph, result.out);
+    result.buffer = ggml_backend_alloc_ctx_tensors(result.ctx, cpu);
+    return result;
+}
+
 static void free_graph(test_graph & graph) {
     if (graph.buffer) {
         ggml_backend_buffer_free(graph.buffer);
@@ -1304,11 +1329,14 @@ int main() {
 
     ggml_tensor * weights = ggml_new_tensor_3d(
             static_ctx, GGML_TYPE_Q4_0, n_in, n_out, n_expert);
+    ggml_tensor * gate_weights = ggml_new_tensor_3d(
+            static_ctx, GGML_TYPE_Q4_0, n_in, n_out, n_expert);
     ggml_tensor * ids = ggml_new_tensor_2d(
             static_ctx, GGML_TYPE_I32, n_used, n_tokens);
     ggml_tensor * activations = ggml_new_tensor_3d(
             static_ctx, GGML_TYPE_F32, n_in, 1, n_tokens);
     ggml_set_name(weights, "blk.0.ffn_up_exps.weight");
+    ggml_set_name(gate_weights, "blk.0.ffn_gate_exps.weight");
     ggml_set_name(ids, "moe_cache_test_ids");
     ggml_set_name(activations, "moe_cache_test_activations");
 
@@ -1345,6 +1373,23 @@ int main() {
     }
     ggml_backend_tensor_set(
             weights, weights_q4.data(), 0, weights_q4.size());
+
+    std::vector<float> gate_f32(ggml_nelements(gate_weights));
+    for (size_t index = 0; index < gate_f32.size(); index++) {
+        gate_f32[index] =
+            -0.12f * std::sin((float) (index % 887) * 0.023f) +
+             0.07f * std::cos((float) (index % 379) * 0.037f);
+    }
+    std::vector<uint8_t> gate_q4(ggml_nbytes(gate_weights));
+    const size_t gate_quantized = ggml_quantize_chunk(
+            GGML_TYPE_Q4_0, gate_f32.data(), gate_q4.data(),
+            0, n_out * n_expert, n_in, nullptr);
+    if (gate_quantized != gate_q4.size()) {
+        fprintf(stderr, "unexpected paired gate quantized size\n");
+        return 1;
+    }
+    ggml_backend_tensor_set(
+            gate_weights, gate_q4.data(), 0, gate_q4.size());
 
     const int32_t ids_data[n_used] = { 0, 1 };
     ggml_backend_tensor_set(ids, ids_data, 0, sizeof(ids_data));
@@ -1383,12 +1428,34 @@ int main() {
     ggml_backend_tensor_get(
             graph.out, reference.data(), 0, reference.size() * sizeof(float));
 
+    test_graph pair_graph = make_pair_graph(
+            cpu, weights, gate_weights, activations, ids);
+    if (!pair_graph.ctx || !pair_graph.buffer) {
+        fprintf(stderr, "failed to create paired test graph\n");
+        return 1;
+    }
+    set_env("GGML_CUDA_MOE_CACHE", "0");
+    if (ggml_backend_graph_compute(cpu, pair_graph.graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "paired CPU reference compute failed\n");
+        return 1;
+    }
+    std::vector<float> pair_reference(ggml_nelements(pair_graph.out));
+    ggml_backend_tensor_get(
+            pair_graph.out, pair_reference.data(), 0,
+            pair_reference.size() * sizeof(float));
+
     bool ok = true;
     ok &= run_scenario("cache-hit", nullptr, cuda, cpu, graph, reference, capture);
     ok &= run_scenario("dispatch-fallback", "dispatch", cuda, cpu, graph, reference, capture);
     ok &= run_scenario("collect-fallback", "collect", cuda, cpu, graph, reference, capture);
     ok &= run_scenario("insert-fallback", "insert", cuda, cpu, graph, reference, capture);
     ok &= run_scenario("slab-fallback", "slab", cuda, cpu, graph, reference, capture);
+    ok &= run_scenario(
+            "fused-cache-hit", nullptr, cuda, cpu, pair_graph, pair_reference, capture);
+    ok &= run_scenario(
+            "fused-dispatch-fallback", "dispatch", cuda, cpu, pair_graph, pair_reference, capture);
+    ok &= run_scenario(
+            "fused-collect-fallback", "collect", cuda, cpu, pair_graph, pair_reference, capture);
     const size_t expert_size = ggml_nbytes(weights) / n_expert;
     ok &= run_precensus_invalidation(
             cuda, cpu, graph, weights,
@@ -1443,6 +1510,7 @@ int main() {
     ok &= run_route_override(cuda_device, cuda, cpu);
     ok &= run_admission_policy(cuda, cpu, capture);
 
+    free_graph(pair_graph);
     free_graph(graph);
     ggml_backend_free(cuda);
 #ifdef GGML_BACKEND_DL

@@ -516,7 +516,8 @@ static __global__ void mul_mat_vec_q(
 
     ggml_cuda_pdl_sync();
     channel_x  = ncols_dst == 1 && ids ? ids[channel_dst]                     : fastdiv(channel_dst, channel_ratio);
-    channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
+    channel_y  = ncols_dst == 1 && ids && fusion.cache_act_ids
+        ? fusion.cache_act_ids[channel_dst] : (ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst);
     sample_dst = blockIdx.z;
 
     const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
@@ -1305,7 +1306,7 @@ void ggml_cuda_op_mul_mat_vec_q(
 }
 
 void ggml_cuda_moe_cache_mmv(
-    const void * pool, ggml_type type0, const char * act_q8, const int32_t * ids_dev,
+    const void * pool, ggml_type type0, const char * act_q8, const int32_t * ids_dev, const int32_t * act_ids_dev,
     float * dst_dev, int64_t n_in, int64_t n_out, int64_t n_slots,
     int64_t slot_stride_bytes, int64_t n_hits, int64_t act_rows, cudaStream_t stream) {
 
@@ -1320,6 +1321,7 @@ void ggml_cuda_moe_cache_mmv(
     const int64_t s12 = act_rows * s11;
 
     ggml_cuda_mm_fusion_args_device fusion_local{};
+    fusion_local.cache_act_ids = act_ids_dev;
 
     // parameter mapping mirrors the ids-branch of ggml_cuda_mul_mat_vec_q with
     // ne12 = ne13 = 1 (single token), ne1 = n_hits, ne2 = ne3 = 1.

@@ -6,6 +6,31 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+// The paired route API is deliberately POD-only: ggml-cpu is C, while the CUDA
+// provider is C++. It extends the legacy per-node seam without changing it.
+struct ggml_moe_cache_tensor_desc {
+    const char * name;
+    const void * host_base;
+    size_t expert_size;
+    int64_t n_in;
+    int64_t n_out;
+    int wtype;
+    int64_t n_expert;
+    int64_t n_tokens;
+};
+
+struct ggml_moe_cache_dispatch_desc {
+    int n_hits;
+    const int32_t * slot_idx;
+    const float * const * act_rows;
+};
+
+struct ggml_moe_cache_result_desc {
+    int n_hits;
+    float * const * dst_rows;
+    int64_t n_out;
+};
+
 
 struct ggml_moe_cache_api {
     const void * owner;
@@ -45,6 +70,26 @@ struct ggml_moe_cache_api {
     // Host buffer mutation or teardown notification. Sessions cancel or finish
     // any fill that still reads the supplied range before this call returns.
     void (*invalidate)(const void * base, size_t size);
+
+    // Begin and plan the two sibling projections of a gate/up route. The ids
+    // array is traversed once and both slot maps are populated together.
+    // Returns NULL unless both tensors can share one device transaction.
+    void * (*route_begin)(
+            const struct ggml_moe_cache_tensor_desc tensors[2],
+            const int32_t * ids, int n_ids, int32_t * slot_idx[2]);
+
+    // Upload/quantize the compact unique activation set once and launch both
+    // expert matvec batches on the same stream. On 0, restore all skipped rows
+    // for both projections before CPU workers start.
+    int (*route_dispatch)(
+            void * route, const struct ggml_moe_cache_dispatch_desc pairs[2]);
+
+    // Download both result sets and wait once. On 0, recompute all skipped rows
+    // for both projections on CPU.
+    int (*route_collect)(
+            void * route, const struct ggml_moe_cache_result_desc pairs[2]);
+
+    void (*route_end)(void * route);
 };
 
 extern struct ggml_moe_cache_api ggml_moe_cache;

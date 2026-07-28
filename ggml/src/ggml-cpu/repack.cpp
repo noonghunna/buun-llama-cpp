@@ -4789,6 +4789,7 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
             //}
             // may be possible if Q8_0 packed...
         } else if (op->op == GGML_OP_MUL_MAT_ID
+                && op->src[3] == nullptr
                 && op->src[0]->buffer
                 && (ggml_n_dims(op->src[0]) == 3)
                 && op->src[0]->buffer->buft == ggml_backend_cpu_repack_buffer_type()
@@ -4808,7 +4809,7 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
     }
 
     ggml::cpu::tensor_traits * get_tensor_traits(const struct ggml_tensor * op) override {
-        if (op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID) {
+        if (op->op == GGML_OP_MUL_MAT || (op->op == GGML_OP_MUL_MAT_ID && op->src[3] == nullptr)) {
             if (op->src[0]->buffer && op->src[0]->buffer->buft == ggml_backend_cpu_repack_buffer_type()) {
                 return (ggml::cpu::tensor_traits *) op->src[0]->extra;
             }

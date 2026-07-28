@@ -202,3 +202,19 @@ left in place. Recommended owner-run validation order remains:
 | Delta | Why | Upstream status |
 |---|---|---|
 | `AGENTS.md` (new) + 3-line pointer prepended to upstream `CLAUDE.md` | fork process contract for agents (policy #10 distillation); pointer keeps single-discovery-path — CLAUDE.md remains buun's content otherwise | ours (never upstreamed; drop pointer if buun adds his own AGENTS.md) |
+
+
+## Round-2 fusion branch conflict warning
+
+The separate `moe-cache-fusion` prototype intentionally edits
+`ggml/src/ggml-cuda/mmvq.cu` and `mmvq.cuh` again. These are the highest-risk
+files when applying its plain diff to the leloch tree: the patch adds a
+cache-only per-hit activation-index pointer, changes the cache MMV signature,
+and changes the ids-branch activation-row mapping. This sits directly beside
+buun's Q2/small-K adaptations documented above.
+
+Treat a textual clean apply as insufficient. Preserve leloch's kernel work,
+verify every `ggml_cuda_moe_cache_mmv` call and the Q2_0/Q2_0_G128 switch arms,
+then compile sm_86 and run the dedicated Q2 tail/last-slot cases before the
+Laguna benchmark. See `docs/moe-cache-fusion/DESIGN.md` for the paired route
+contract and fallback semantics.

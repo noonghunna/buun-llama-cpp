@@ -2214,30 +2214,47 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         up  = ggml_view_3d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], n_ff * gate_up->nb[0]);
         cb(up, "ffn_moe_up", il);
     } else {
-        // separate gate and up path
-        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
-        cb(up, "ffn_moe_up", il);
+        const bool can_pair_gate_up = gate_exps && !up_exps_s && !gate_exps_s &&
+            loras->empty() && !up_exps->extra && !gate_exps->extra &&
+            up_exps->type == gate_exps->type &&
+            up_exps->ne[0] == gate_exps->ne[0] &&
+            up_exps->ne[1] == gate_exps->ne[1] &&
+            up_exps->ne[2] == gate_exps->ne[2];
 
-        if (up_exps_s) {
-            cb(up, "ffn_moe_up_scaled", il);
+        if (can_pair_gate_up) {
+            // Pair order is [up, gate]. The cache provider launches both from
+            // one compact activation upload and collects them with one wait.
+            ggml_tensor * pair = ggml_mul_mat_id_pair(
+                ctx0, up_exps, gate_exps, cur, selected_experts);
+            cb(pair, "ffn_moe_gate_up_route", il);
+            const int64_t n_ff = up_exps->ne[1];
+            up = ggml_view_3d(ctx0, pair, n_ff, pair->ne[1], pair->ne[2],
+                              pair->nb[1], pair->nb[2], 0);
+            cur = ggml_view_3d(ctx0, pair, n_ff, pair->ne[1], pair->ne[2],
+                               pair->nb[1], pair->nb[2], n_ff * pair->nb[0]);
+            cb(up, "ffn_moe_up", il);
+            cb(cur, "ffn_moe_gate", il);
+        } else {
+            up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s);
+            cb(up, "ffn_moe_up", il);
+            if (up_exps_s) {
+                cb(up, "ffn_moe_up_scaled", il);
+            }
+            if (gate_exps) {
+                cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s);
+                cb(cur, "ffn_moe_gate", il);
+            } else {
+                cur = up;
+            }
+            if (gate_exps_s) {
+                cb(cur, "ffn_moe_gate_scaled", il);
+            }
         }
 
         if (up_exps_b) {
             up = ggml_add_id(ctx0, up, up_exps_b, selected_experts);
             cb(up, "ffn_moe_up_biased", il);
         }
-
-        if (gate_exps) {
-            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
-            cb(cur, "ffn_moe_gate", il);
-        } else {
-            cur = up;
-        }
-
-        if (gate_exps_s) {
-            cb(cur, "ffn_moe_gate_scaled", il);
-        }
-
         if (gate_exps_b) {
             cur = ggml_add_id(ctx0, cur, gate_exps_b, selected_experts);
             cb(cur, "ffn_moe_gate_biased", il);

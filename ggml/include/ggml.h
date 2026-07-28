@@ -1488,6 +1488,15 @@ extern "C" {
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
 
+    // paired indirect matrix multiplication. Results are packed as
+    // [as0 rows, as1 rows, n_expert_used, n_tokens] along dimension 0.
+    GGML_API struct ggml_tensor * ggml_mul_mat_id_pair(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * as0,
+            struct ggml_tensor  * as1,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * ids);
+
     // A: m columns, n rows,
     // B: p columns, n rows,
     // result is m columns, p rows

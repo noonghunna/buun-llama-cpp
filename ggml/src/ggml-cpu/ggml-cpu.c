@@ -1829,6 +1829,169 @@ static void ggml_compute_forward_mul_mat_id(
 
 /////////////////////////////////
 
+struct ggml_mmid_pair_state {
+    void * route;
+    int32_t original[64];
+    int32_t filtered[2][64];
+    int32_t slots[2][64];
+    int n_ids;
+    int n_hits[2];
+    int collect_failed;
+};
+
+static void ggml_compute_forward_mul_mat_id_pair(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    const struct ggml_tensor * weights[2] = {dst->src[0], dst->src[3]};
+    struct ggml_tensor * src1 = dst->src[1];
+    const struct ggml_tensor * ids = dst->src[2];
+    const int ith = params->ith;
+    const int total_ids = (int)(ids->ne[0] * ids->ne[1]);
+    const int64_t n_out = weights[0]->ne[1];
+    GGML_ASSERT(weights[1] && weights[1]->ne[1] == n_out);
+    GGML_ASSERT(total_ids <= 64);
+
+    uintptr_t state_address =
+        (uintptr_t)((char *)params->wdata + params->wsize -
+                    sizeof(struct ggml_mmid_pair_state));
+    state_address &= ~(uintptr_t)(CACHE_LINE_SIZE - 1);
+    struct ggml_mmid_pair_state * state =
+        (struct ggml_mmid_pair_state *)state_address;
+
+    if (ith == 0) {
+        memset(state, 0, sizeof(*state));
+        state->n_ids = total_ids;
+        for (int64_t token = 0; token < ids->ne[1]; token++) {
+            for (int id = 0; id < ids->ne[0]; id++) {
+                const int index = (int)(token * ids->ne[0] + id);
+                const int32_t expert = *(const int32_t *)
+                    ((const char *)ids->data + token * ids->nb[1] + id * ids->nb[0]);
+                state->original[index] = expert;
+                state->filtered[0][index] = expert;
+                state->filtered[1][index] = expert;
+                state->slots[0][index] = -1;
+                state->slots[1][index] = -1;
+            }
+        }
+
+        bool eligible = ggml_moe_cache.route_begin &&
+                        ggml_moe_cache.route_dispatch &&
+                        ggml_moe_cache.route_collect &&
+                        ggml_moe_cache.route_end &&
+                        src1->type == GGML_TYPE_F32;
+        struct ggml_moe_cache_tensor_desc tensors[2];
+        for (int pair = 0; pair < 2; pair++) {
+            ggml_backend_buffer_t buffer = weights[pair]->view_src
+                ? weights[pair]->view_src->buffer : weights[pair]->buffer;
+            eligible = eligible && weights[pair]->op == GGML_OP_NONE && buffer &&
+                ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+            tensors[pair] = (struct ggml_moe_cache_tensor_desc) {
+                weights[pair]->name, weights[pair]->data, weights[pair]->nb[2],
+                weights[pair]->ne[0], weights[pair]->ne[1], (int)weights[pair]->type,
+                weights[pair]->ne[2], ids->ne[1],
+            };
+        }
+
+        int32_t * slot_maps[2] = {state->slots[0], state->slots[1]};
+        if (eligible) {
+            state->route = ggml_moe_cache.route_begin(
+                tensors, state->original, total_ids, slot_maps);
+        }
+        if (state->route) {
+            int32_t compact_slots[2][64];
+            const float * hit_acts[2][64];
+            for (int pair = 0; pair < 2; pair++) {
+                for (int index = 0; index < total_ids; index++) {
+                    if (state->slots[pair][index] < 0) {
+                        continue;
+                    }
+                    const int id = index % ids->ne[0];
+                    const int token = index / ids->ne[0];
+                    const int64_t activation = id % src1->ne[1];
+                    const int hit = state->n_hits[pair]++;
+                    compact_slots[pair][hit] = state->slots[pair][index];
+                    hit_acts[pair][hit] = (const float *)
+                        ((const char *)src1->data + activation * src1->nb[1] +
+                         token * src1->nb[2]);
+                    state->filtered[pair][index] = -1;
+                }
+            }
+            const struct ggml_moe_cache_dispatch_desc dispatch[2] = {
+                {state->n_hits[0], compact_slots[0], hit_acts[0]},
+                {state->n_hits[1], compact_slots[1], hit_acts[1]},
+            };
+            if (!ggml_moe_cache.route_dispatch(state->route, dispatch)) {
+                memcpy(state->filtered[0], state->original,
+                       total_ids * sizeof(int32_t));
+                memcpy(state->filtered[1], state->original,
+                       total_ids * sizeof(int32_t));
+                state->n_hits[0] = state->n_hits[1] = 0;
+                ggml_moe_cache.route_end(state->route);
+                state->route = NULL;
+            }
+        }
+    }
+    ggml_barrier(params->threadpool);
+
+    struct ggml_tensor filtered_ids = *ids;
+    filtered_ids.nb[0] = sizeof(int32_t);
+    filtered_ids.nb[1] = ids->ne[0] * sizeof(int32_t);
+    struct ggml_tensor cpu_weights[2] = {*weights[0], *weights[1]};
+    struct ggml_tensor cpu_dst[2] = {*dst, *dst};
+    for (int pair = 0; pair < 2; pair++) {
+        // Prevent recursive legacy cache admission; the paired route owns it.
+        cpu_weights[pair].op = GGML_OP_VIEW;
+        filtered_ids.data = state->filtered[pair];
+        cpu_dst[pair].data = (char *)dst->data + pair * n_out * sizeof(float);
+        cpu_dst[pair].ne[0] = n_out;
+        cpu_dst[pair].src[0] = &cpu_weights[pair];
+        cpu_dst[pair].src[1] = src1;
+        cpu_dst[pair].src[2] = &filtered_ids;
+        cpu_dst[pair].src[3] = NULL;
+        ggml_compute_forward_mul_mat_id(params, &cpu_dst[pair]);
+    }
+
+    if (ith == 0 && state->route) {
+        float * dst_rows[2][64];
+        int seen[2] = {0, 0};
+        for (int pair = 0; pair < 2; pair++) {
+            for (int index = 0; index < total_ids; index++) {
+                if (state->slots[pair][index] < 0) {
+                    continue;
+                }
+                const int id = index % ids->ne[0];
+                const int token = index / ids->ne[0];
+                dst_rows[pair][seen[pair]++] = (float *)
+                    ((char *)dst->data + token * dst->nb[2] + id * dst->nb[1] +
+                     pair * n_out * sizeof(float));
+            }
+        }
+        const struct ggml_moe_cache_result_desc results[2] = {
+            {state->n_hits[0], dst_rows[0], n_out},
+            {state->n_hits[1], dst_rows[1], n_out},
+        };
+        if (!ggml_moe_cache.route_collect(state->route, results)) {
+            memcpy(state->filtered[0], state->original,
+                   total_ids * sizeof(int32_t));
+            memcpy(state->filtered[1], state->original,
+                   total_ids * sizeof(int32_t));
+            state->collect_failed = 1;
+        }
+        ggml_moe_cache.route_end(state->route);
+        state->route = NULL;
+    }
+    ggml_barrier(params->threadpool);
+
+    // A failed combined collect restores correctness for each projection. The
+    // all-CPU replay is intentionally parallel and uses the canonical kernel.
+    if (state->collect_failed) {
+        for (int pair = 0; pair < 2; pair++) {
+            filtered_ids.data = state->filtered[pair];
+            ggml_compute_forward_mul_mat_id(params, &cpu_dst[pair]);
+        }
+    }
+}
+
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
     GGML_ASSERT(params);
 
@@ -1960,7 +2123,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             } break;
         case GGML_OP_MUL_MAT_ID:
             {
-                ggml_compute_forward_mul_mat_id(params, tensor);
+                if (tensor->src[3]) {
+                    ggml_compute_forward_mul_mat_id_pair(params, tensor);
+                } else {
+                    ggml_compute_forward_mul_mat_id(params, tensor);
+                }
             } break;
         case GGML_OP_OUT_PROD:
             {
@@ -3007,6 +3174,9 @@ struct ggml_cplan ggml_graph_plan(
                         cur += n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping) + sizeof(int64_t);
                         // atomic_current_chunk
                         cur += CACHE_LINE_SIZE*n_as + CACHE_LINE_SIZE;
+                        if (node->src[3]) {
+                            cur += sizeof(struct ggml_mmid_pair_state) + CACHE_LINE_SIZE;
+                        }
                     } break;
                 case GGML_OP_OUT_PROD:
                     {

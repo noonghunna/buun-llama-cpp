@@ -1555,6 +1555,10 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * x_scale = nullptr;
     const void * gate_scale = nullptr;
     ggml_glu_op glu_op;
+    // Cache-only mapping from dispatched hit row to compact activation row.
+    // This does not participate in the generic matmul fusion feature switch.
+    const int32_t * cache_act_ids = nullptr;
+
 };
 
 struct ggml_cuda_kernel_launch_params {
