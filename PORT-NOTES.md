@@ -202,3 +202,4 @@ left in place. Recommended owner-run validation order remains:
 | Delta | Why | Upstream status |
 |---|---|---|
 | `AGENTS.md` (new) + 3-line pointer prepended to upstream `CLAUDE.md` | fork process contract for agents (policy #10 distillation); pointer keeps single-discovery-path — CLAUDE.md remains buun's content otherwise | ours (never upstreamed; drop pointer if buun adds his own AGENTS.md) |
+| `vbr-vmm.cu` one-shot MoE-cache trim on CUDA physical-map OOM | dynamic VBR uses a private `cuMemCreate` path, so it must get the same allocator-pressure escape hatch as the generic CUDA VMM pool before returning the existing recoverable failure | ours (fork issue #6; upstream candidate after dynamic-VBR growth-to-full-context device validation) |

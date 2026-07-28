@@ -11,6 +11,7 @@
 // also sidesteps ROCR-Runtime issue #285 (can't unmap one giant range on HIP).
 
 #include "common.cuh"
+#include "moe-cache.cuh"
 #include "ggml-cuda.h"
 
 #include <set>
@@ -80,7 +81,14 @@ bool ggml_backend_cuda_vmm_pool_map(ggml_vbr_vmm_pool * pool, size_t off, size_t
         // don't go through ggml_cuda_set_device's translation).
         prop.location.id   = ggml_cuda_info().devices[pool->device].physical_device;
         CUmemGenericAllocationHandle handle;
-        if (cuMemCreate(&handle, g, &prop, 0) != CUDA_SUCCESS) {
+        CUresult create_result = cuMemCreate(&handle, g, &prop, 0);
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        if (create_result == CUDA_ERROR_OUT_OF_MEMORY &&
+            ggml_moe_cache_trim(pool->device) > 0) {
+            create_result = cuMemCreate(&handle, g, &prop, 0);
+        }
+#endif
+        if (create_result != CUDA_SUCCESS) {
             return false; // physical exhausted — caller decides (degrade / abort)
         }
         const CUdeviceptr ptr = (CUdeviceptr)((char *) pool->base + c);
