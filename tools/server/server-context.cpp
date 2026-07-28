@@ -1678,19 +1678,39 @@ private:
                 return false;
             }
 
-            // Auto-detect DFlash from drafter model architecture
-            if (llama_model_dflash_block_size(model_dft.get()) > 0 &&
-                params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH) {
-                params_base.speculative.set_type(COMMON_SPECULATIVE_TYPE_DFLASH);
-                SRV_INF("auto-detected DFlash drafter (block_size=%d)\n",
-                        llama_model_dflash_block_size(model_dft.get()));
+            // The fork carries two incompatible DFlash forward contracts:
+            // dflash-draft consumes a cross-data ring, while the official
+            // architecture=dflash model consumes target features through its
+            // encoder followed by decoder-KV injection. Route by architecture;
+            // treating the official model as the fork type silently ignores the
+            // ring and produces drafts unrelated to the target context.
+            char draft_arch[32] = {};
+            const auto configured_type = params_base.speculative.type();
+            const bool official_dflash =
+                llama_model_meta_val_str(model_dft.get(), "general.architecture", draft_arch, sizeof(draft_arch)) >= 0 &&
+                strcmp(draft_arch, "dflash") == 0;
+            const int dflash_block_size = llama_model_dflash_block_size(model_dft.get());
+            if (dflash_block_size > 0) {
+                const auto detected_type = official_dflash
+                    ? COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH
+                    : COMMON_SPECULATIVE_TYPE_DFLASH;
+                if (params_base.speculative.type() != detected_type) {
+                    params_base.speculative.set_type(detected_type);
+                    SRV_INF("DFlash drafter architecture '%s' uses %s forward contract\n",
+                            draft_arch, official_dflash ? "encoder/KV-injection" : "cross-ring");
+                }
+                SRV_INF("auto-detected DFlash drafter (block_size=%d)\n", dflash_block_size);
             }
 
-            if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
-                const int block_size = llama_model_dflash_block_size(model_dft.get());
+            const bool uses_dflash =
+                params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH ||
+                params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;
+            if (uses_dflash) {
+                const int block_size = dflash_block_size;
                 params_dft.n_ubatch = LLAMA_DFLASH_MAX_SLOTS * block_size;
-                params_dft.n_parallel = std::max(1,
-                    std::min(params_base.speculative.dflash_max_slots, params_base.n_parallel));
+                params_dft.n_parallel = params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH
+                    ? std::max(1, std::min(params_base.speculative.dflash_max_slots, params_base.n_parallel))
+                    : params_base.n_parallel;
 
                 // --spec-dflash-default leaves draft-max at -1 = auto: the drafter emits
                 // at most block_size - 1 tokens per step and the full depth strictly wins
@@ -1700,6 +1720,16 @@ private:
                     SRV_INF("draft-max auto (DFlash): %d (drafter block_size %d)\n",
                             params_base.speculative.n_max, block_size);
                 }
+
+                // The fork preset writes top-level DFlash fields; standard
+                // draft-dflash flags write the draft sub-structure. Only bridge
+                // from the former when that was the configured contract, so an
+                // explicit --spec-draft-n-max remains authoritative.
+                if (official_dflash && configured_type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                    params_base.speculative.draft.n_max = params_base.speculative.n_max;
+                    params_base.speculative.draft.n_min = params_base.speculative.n_min;
+                    params_base.speculative.draft.p_min = params_base.speculative.p_min;
+                }
             }
 
             params_base.speculative.model_dft = model_dft.get();
@@ -1707,7 +1737,7 @@ private:
             // share buffers with the target context (upstream #24922 family)
             params_base.speculative.cparams_dft.ctx_other = ctx_tgt;
 
-            if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
+            if (uses_dflash) {
                 llama_model_share_tensors(model_dft.get(), llama_get_model(ctx_tgt));
             }
 
@@ -1720,6 +1750,17 @@ private:
                 ctx_dft.reset(llama_init_from_model(model_dft.get(), cparams));
                 if (ctx_dft == nullptr) {
                     SRV_ERR("%s", "failed to create draft context\n");
+                    return false;
+                }
+                ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft.get());
+                params_base.speculative.draft.ctx_tgt = ctx_tgt;
+                params_base.speculative.draft.ctx_dft = ctx_dft.get();
+            } else if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) {
+                auto cparams = common_context_params_to_llama(params_dft);
+                cparams.ctx_other = ctx_tgt;
+                ctx_dft.reset(llama_init_from_model(model_dft.get(), cparams));
+                if (ctx_dft == nullptr) {
+                    SRV_ERR("%s", "failed to create official DFlash draft context\n");
                     return false;
                 }
                 ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft.get());
@@ -5116,8 +5157,11 @@ private:
                 slot.n_accepted_per_pos[i]++;
             }
 
-            // notify the shared (upstream) speculative state, if this slot uses it
-            if (!slot.spec && spec) {
+            // Notify whichever implementation generated the draft. Fork DFlash
+            // owns per-slot state; upstream-style implementations use `spec`.
+            if (slot.spec) {
+                common_speculative_accept(slot.spec.get(), ids.size() - 1);
+            } else if (spec) {
                 common_speculative_accept(spec.get(), slot.id, ids.size() - 1);
             }
 

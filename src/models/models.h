@@ -1296,6 +1296,10 @@ struct llama_model_dflash : public llama_model_base {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
+    // Laguna decoders normalize injected context K/V and use causal noise
+    // attention; generic DFlash decoders retain the original contract.
+    bool decoder_laguna = false;
+
     ggml_tensor * aux_norm = nullptr;
 
     template <bool is_enc>

@@ -42,6 +42,10 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
         hparams.rope_freq_scale_train_swa = hparams.rope_freq_scale_train;
     }
 
+    std::string decoder_arch;
+    ml.get_key("dflash.decoder_arch", decoder_arch, false);
+    decoder_laguna = decoder_arch == "laguna";
+
     type = LLM_TYPE_UNKNOWN;
 }
 
@@ -184,11 +188,19 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
         res->add_input(std::move(inp));
 
+        const auto & model_df = static_cast<const llama_model_dflash &>(model);
+
         for (int il = 0; il < n_layer; ++il) {
             const auto & layer = model.layers[il];
 
-            ggml_tensor * Kcur = build_lora_mm(layer.wk, inp_g);
-            ggml_tensor * Vcur = build_lora_mm(layer.wv, inp_g);
+            ggml_tensor * kv_inp = inp_g;
+            if (model_df.decoder_laguna) {
+                kv_inp = build_norm(inp_g, layer.attn_norm, NULL, LLM_NORM_RMS, il);
+                cb(kv_inp, "kv_inp_normed", il);
+            }
+
+            ggml_tensor * Kcur = build_lora_mm(layer.wk, kv_inp);
+            ggml_tensor * Vcur = build_lora_mm(layer.wv, kv_inp);
 
             Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
             Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
