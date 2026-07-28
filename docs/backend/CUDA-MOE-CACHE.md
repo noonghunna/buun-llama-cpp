@@ -40,6 +40,8 @@ min(configured budget, free VRAM - 3072 MiB reserve)
 
 The configured-budget term is omitted for `auto` and `on`. A fixed `N` is a cap for cache slabs and device-side dispatch scratch together, not a guaranteed slab allocation. Pool allocation may be smaller after reserving scratch or retrying an allocation, and no pool is created when fewer than 64 slots fit.
 
+When dynamic VBR owns a VMM-backed KV cache on the same device, it publishes its intended mapped-physical reach before the expert cache freezes this budget. The expert cache additionally subtracts VBR's target-minus-already-mapped bytes from live free VRAM; already-mapped pages are not subtracted twice. As VBR maps or unmaps pages, the outstanding reservation changes with it. If a later VBR physical-page allocation still reaches OOM, that private VMM path trims the MoE cache once and retries once before returning its normal recoverable failure. A trim disables the affected expert-cache device for the rest of that scheduler session.
+
 Tensor shapes are collected before pools are allocated. Allocation waits for a repeated shape census and 64 stable visits so early graph discovery does not give all capacity to the first tensor shape. Capacity is divided among discovered shapes. A layer is assigned once to a selected device and keeps that assignment while the device remains usable. If that device cannot host a different tensor shape from the layer, the tensor receives its own stable assignment. Initial assignments are deterministic and weighted by usable slab capacity after existing pools and dispatch scratch are accounted for.
 
 The `[moe-cache] enabled` message is printed only after the first pool is allocated. If it is absent, the cache did not become active.

@@ -46,6 +46,10 @@ GGML_BACKEND_API struct ggml_vbr_vmm_pool * ggml_backend_cuda_vmm_pool_init(int 
 GGML_BACKEND_API void   ggml_backend_cuda_vmm_pool_free(struct ggml_vbr_vmm_pool * pool);
 GGML_BACKEND_API void * ggml_backend_cuda_vmm_pool_base(struct ggml_vbr_vmm_pool * pool);
 GGML_BACKEND_API size_t ggml_backend_cuda_vmm_pool_mapped(struct ggml_vbr_vmm_pool * pool);
+// Future mapped-physical reach promised to VBR. The per-device query returns only
+// target-minus-already-mapped bytes, so callers can subtract it from live free VRAM.
+GGML_BACKEND_API size_t ggml_backend_cuda_vmm_pool_set_reservation(struct ggml_vbr_vmm_pool * pool, size_t target_mapped);
+GGML_BACKEND_API size_t ggml_backend_cuda_vmm_reserved(int device);
 GGML_BACKEND_API bool   ggml_backend_cuda_vmm_pool_map(struct ggml_vbr_vmm_pool * pool, size_t off, size_t len);
 GGML_BACKEND_API bool   ggml_backend_cuda_vmm_pool_unmap(struct ggml_vbr_vmm_pool * pool, size_t off, size_t len);
 GGML_BACKEND_API void   ggml_backend_cuda_vmm_pool_clear(struct ggml_vbr_vmm_pool * pool);

@@ -1,6 +1,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-backend-moe-cache.h"
+#include "ggml-vbr.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1263,6 +1264,61 @@ static bool run_admission_policy(
     return ok;
 }
 
+static bool run_vbr_reservation_ledger(ggml_backend_dev_t cuda_device) {
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(cuda_device);
+    auto get_iface = (ggml_backend_vbr_iface_fn_t)
+        ggml_backend_reg_get_proc_address(reg, GGML_VBR_BACKEND_IFACE_PROC);
+    const ggml_vbr_backend_iface * iface = get_iface ? get_iface() : nullptr;
+    if (!iface) {
+        fprintf(stderr, "cache-vbr-ledger: CUDA VBR interface is unavailable\n");
+        return false;
+    }
+
+    int device = -1;
+    for (int candidate = 0; candidate < iface->get_device_count(); candidate++) {
+        if (ggml_backend_buft_get_device(iface->buffer_type(candidate)) == cuda_device) {
+            device = candidate;
+            break;
+        }
+    }
+    if (device < 0) {
+        fprintf(stderr, "cache-vbr-ledger: CUDA device ordinal was not found\n");
+        return false;
+    }
+    if (!iface->vmm_available(device)) {
+        printf("cache-vbr-ledger: SKIP (VMM unavailable)\n");
+        return true;
+    }
+
+    const size_t gran = iface->vmm_granularity(device);
+    const size_t baseline = iface->vmm_reserved(device);
+    ggml_vbr_vmm_pool * pool = gran > 0
+        ? iface->vmm_pool_init(device, 2 * gran) : nullptr;
+    if (!pool) {
+        fprintf(stderr, "cache-vbr-ledger: failed to create test VMM pool\n");
+        return false;
+    }
+
+    bool ok =
+        iface->vmm_pool_set_reservation(pool, 2 * gran) == 2 * gran &&
+        iface->vmm_reserved(device) == baseline + 2 * gran;
+    if (ok) {
+        ok = iface->vmm_pool_map(pool, 0, gran) &&
+             iface->vmm_reserved(device) == baseline + gran;
+    }
+    if (ok) {
+        ok = iface->vmm_pool_unmap(pool, 0, gran) &&
+             iface->vmm_reserved(device) == baseline + 2 * gran;
+    }
+    ok &= iface->vmm_pool_set_reservation(pool, 0) == 0;
+    ok &= iface->vmm_reserved(device) == baseline;
+    iface->vmm_pool_free(pool);
+    ok &= iface->vmm_reserved(device) == baseline;
+
+    printf("cache-vbr-ledger: %s\n", ok ? "OK" : "FAIL");
+    return ok;
+}
+
 } // namespace
 
 int main() {
@@ -1384,6 +1440,7 @@ int main() {
             graph.out, reference.data(), 0, reference.size() * sizeof(float));
 
     bool ok = true;
+    ok &= run_vbr_reservation_ledger(cuda_device);
     ok &= run_scenario("cache-hit", nullptr, cuda, cpu, graph, reference, capture);
     ok &= run_scenario("dispatch-fallback", "dispatch", cuda, cpu, graph, reference, capture);
     ok &= run_scenario("collect-fallback", "collect", cuda, cpu, graph, reference, capture);

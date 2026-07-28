@@ -85,6 +85,10 @@ struct ggml_vbr_backend_iface {
     void   (*vmm_pool_free)  (struct ggml_vbr_vmm_pool * pool);
     void * (*vmm_pool_base)  (struct ggml_vbr_vmm_pool * pool);
     size_t (*vmm_pool_mapped)(struct ggml_vbr_vmm_pool * pool);       // mapped-physical bytes
+    // Publish this pool's intended mapped-physical reach. Returns target-minus-mapped for
+    // this pool; vmm_reserved returns that outstanding sum for all pools on one device.
+    size_t (*vmm_pool_set_reservation)(struct ggml_vbr_vmm_pool * pool, size_t target_mapped);
+    size_t (*vmm_reserved)(int device);
     // ensure [off, off+len) is backed by physical pages (rounded out to granularity; new pages
     // zeroed). false = physical memory exhausted (caller degrades or aborts); driver errors
     // beyond OOM are fatal inside the backend.

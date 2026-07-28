@@ -1369,6 +1369,19 @@ llama_kv_cache::llama_kv_cache(
                             vbr_floor_cost_bytes_/1024.0/1024.0);
                 }
             }
+            // Publish the future mapped-physical reach before the scheduler constructs its
+            // MoE cache. The backend ledger subtracts already-mapped pages, so only the
+            // target-minus-mapped remainder is protected from the cache's free-now snapshot.
+            for (size_t pi = 0; pi < vbr_pools_.size(); ++pi) {
+                auto & p = vbr_pools_[pi];
+                if (p.vmm == nullptr) {
+                    continue;
+                }
+                const size_t outstanding = p.be->vmm_pool_set_reservation(p.vmm, p.budget);
+                LLAMA_LOG_INFO("%s: VBR pool #%zu (device %d) reservation: %.2f MiB target, "
+                        "%.2f MiB outstanding\n", __func__, pi, p.device,
+                        p.budget/1024.0/1024.0, outstanding/1024.0/1024.0);
+            }
             // f16 sink-stash: DEFAULT ON (128 rows) since the S6 long-decode gate (2026-07-03)
             // — erases sink-row requant accumulation across any hop count for ~8 MiB + µs per
             // degrade. VBR_STASH_ROWS overrides (0 disables).
@@ -2729,6 +2742,7 @@ void llama_kv_cache::vbr_rederive_budget() {
                     __func__, pi, p.device, p.budget/1024.0/1024.0, reach/1024.0/1024.0,
                     vbr_growth_headroom_/1024.0/1024.0, vbr_params_.device_share);
             p.budget = reach;
+            p.be->vmm_pool_set_reservation(p.vmm, p.budget);
         }
     }
 }

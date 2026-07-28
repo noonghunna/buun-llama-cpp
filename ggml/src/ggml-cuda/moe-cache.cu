@@ -804,15 +804,26 @@ static bool moe_cache_prepare_budget(
     }
 
     const size_t reserve = session.config.reserve_mb << 20;
-    size_t available = free_memory > reserve ? free_memory - reserve : 0;
+    const size_t vbr_reserved = ggml_backend_cuda_vmm_reserved(device.physical);
+    const size_t protected_bytes = vbr_reserved <= SIZE_MAX - reserve
+        ? reserve + vbr_reserved : SIZE_MAX;
+    size_t available = free_memory > protected_bytes
+        ? free_memory - protected_bytes : 0;
     if (session.config.budget_mb > 0) {
         available = std::min(available, session.config.budget_mb << 20);
     }
     device.budget_limit = available;
 
+    if (vbr_reserved > 0) {
+        MOE_CACHE_LOG("[moe-cache] CUDA%d protecting %zu MiB outstanding VBR reach; "
+                "cache budget=%zu MiB after %zu MiB reserve\n",
+                device.physical, vbr_reserved >> 20, available >> 20,
+                session.config.reserve_mb);
+    }
     if (available == 0) {
-        MOE_CACHE_LOG("[moe-cache] CUDA%d has no cache budget after %zu MiB reserve\n",
-                device.physical, session.config.reserve_mb);
+        MOE_CACHE_LOG("[moe-cache] CUDA%d has no cache budget after %zu MiB reserve "
+                "and %zu MiB VBR reservation\n",
+                device.physical, session.config.reserve_mb, vbr_reserved >> 20);
         return false;
     }
     return true;

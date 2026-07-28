@@ -14,6 +14,8 @@
 #include "moe-cache.cuh"
 #include "ggml-cuda.h"
 
+#include <algorithm>
+#include <mutex>
 #include <set>
 
 #if defined(GGML_USE_VMM)
@@ -24,7 +26,39 @@ struct ggml_vbr_vmm_pool {
     size_t      va_size = 0;
     size_t      gran    = 0;
     std::set<size_t> chunks; // mapped chunk offsets (each gran bytes)
+    size_t reservation_target      = 0;
+    size_t reservation_outstanding = 0;
 };
+
+// Same-process VBR/cache accounting. Driver operations never run under this mutex: a
+// query can briefly overstate outstanding reach while a page operation completes, which
+// only makes the cache budget more conservative.
+static std::mutex g_vbr_reservation_mu;
+static size_t g_vbr_reserved[GGML_CUDA_MAX_DEVICES] = {};
+
+static size_t vbr_reservation_refresh_locked(ggml_vbr_vmm_pool * pool) {
+    const size_t mapped = pool->chunks.size() * pool->gran;
+    const size_t next = pool->reservation_target > mapped
+        ? pool->reservation_target - mapped : 0;
+    const int physical = ggml_cuda_info().devices[pool->device].physical_device;
+    size_t & total = g_vbr_reserved[physical];
+    if (next >= pool->reservation_outstanding) {
+        const size_t delta = next - pool->reservation_outstanding;
+        GGML_ASSERT(delta <= SIZE_MAX - total);
+        total += delta;
+    } else {
+        const size_t delta = pool->reservation_outstanding - next;
+        GGML_ASSERT(delta <= total);
+        total -= delta;
+    }
+    pool->reservation_outstanding = next;
+    return next;
+}
+
+static size_t vbr_reservation_refresh(ggml_vbr_vmm_pool * pool) {
+    std::lock_guard<std::mutex> lock(g_vbr_reservation_mu);
+    return vbr_reservation_refresh_locked(pool);
+}
 
 bool ggml_backend_cuda_vmm_available(int device) {
     return device >= 0 && device < ggml_cuda_info().device_count && ggml_cuda_info().devices[device].vmm;
@@ -59,6 +93,25 @@ size_t ggml_backend_cuda_vmm_pool_mapped(ggml_vbr_vmm_pool * pool) {
     return pool->chunks.size() * pool->gran;
 }
 
+size_t ggml_backend_cuda_vmm_pool_set_reservation(
+        ggml_vbr_vmm_pool * pool, size_t target_mapped) {
+    if (!pool) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(g_vbr_reservation_mu);
+    pool->reservation_target = std::min(target_mapped, pool->va_size);
+    return vbr_reservation_refresh_locked(pool);
+}
+
+size_t ggml_backend_cuda_vmm_reserved(int device) {
+    if (device < 0 || device >= ggml_cuda_info().device_count) {
+        return 0;
+    }
+    const int physical = ggml_cuda_info().devices[device].physical_device;
+    std::lock_guard<std::mutex> lock(g_vbr_reservation_mu);
+    return g_vbr_reserved[physical];
+}
+
 bool ggml_backend_cuda_vmm_pool_map(ggml_vbr_vmm_pool * pool, size_t off, size_t len) {
     if (len == 0) {
         return true;
@@ -89,6 +142,9 @@ bool ggml_backend_cuda_vmm_pool_map(ggml_vbr_vmm_pool * pool, size_t off, size_t
         }
 #endif
         if (create_result != CUDA_SUCCESS) {
+            if (zeroed) {
+                vbr_reservation_refresh(pool);
+            }
             return false; // physical exhausted — caller decides (degrade / abort)
         }
         const CUdeviceptr ptr = (CUdeviceptr)((char *) pool->base + c);
@@ -105,6 +161,7 @@ bool ggml_backend_cuda_vmm_pool_map(ggml_vbr_vmm_pool * pool, size_t off, size_t
         zeroed = true;
     }
     if (zeroed) {
+        vbr_reservation_refresh(pool);
         // the memsets ran on the legacy stream; ggml streams are non-blocking, so nothing orders
         // them against the compute/side streams that write these pages next — settle them here
         // (rare: only on watermark growth, and the pages are new)
@@ -124,8 +181,11 @@ bool ggml_backend_cuda_vmm_pool_unmap(ggml_vbr_vmm_pool * pool, size_t off, size
         if (it == pool->chunks.end()) {
             continue;
         }
-        CU_CHECK(cuMemUnmap((CUdeviceptr)((char *) pool->base + c), g));
+        // Raise outstanding reach before live free VRAM rises. This keeps concurrent
+        // budget snapshots conservative without holding the ledger mutex across CUDA.
         pool->chunks.erase(it);
+        vbr_reservation_refresh(pool);
+        CU_CHECK(cuMemUnmap((CUdeviceptr)((char *) pool->base + c), g));
     }
     return true;
 }
@@ -145,6 +205,8 @@ void ggml_backend_cuda_vmm_pool_free(ggml_vbr_vmm_pool * pool) {
     if (!pool) {
         return;
     }
+    // Destruction cancels future reach before releasing mapped pages.
+    ggml_backend_cuda_vmm_pool_set_reservation(pool, 0);
     ggml_cuda_set_device(pool->device);
     // cuMemUnmap/cuMemAddressFree are host-immediate with no implicit device sync (unlike
     // cudaFree): under -sm layer pipeline parallelism a prior ubatch's kernels can still be
@@ -165,6 +227,8 @@ size_t ggml_backend_cuda_vmm_granularity(int)                                { r
 ggml_vbr_vmm_pool * ggml_backend_cuda_vmm_pool_init(int, size_t)            { return nullptr; }
 void * ggml_backend_cuda_vmm_pool_base(ggml_vbr_vmm_pool *)                 { return nullptr; }
 size_t ggml_backend_cuda_vmm_pool_mapped(ggml_vbr_vmm_pool *)               { return 0;       }
+size_t ggml_backend_cuda_vmm_pool_set_reservation(ggml_vbr_vmm_pool *, size_t){ return 0;       }
+size_t ggml_backend_cuda_vmm_reserved(int)                                    { return 0;       }
 bool   ggml_backend_cuda_vmm_pool_map(ggml_vbr_vmm_pool *, size_t, size_t)  { return false;   }
 bool   ggml_backend_cuda_vmm_pool_unmap(ggml_vbr_vmm_pool *, size_t, size_t){ return false;   }
 void   ggml_backend_cuda_vmm_pool_clear(ggml_vbr_vmm_pool *)                {                 }
