@@ -1872,6 +1872,9 @@ static void ggml_compute_forward_mul_mat_id_pair(
             cpu_dst[pair].src[2] = ids;
             cpu_dst[pair].src[3] = NULL;
             ggml_compute_forward_mul_mat_id(params, &cpu_dst[pair]);
+            if (pair == 0) {
+                ggml_barrier(params->threadpool);
+            }
         }
         return;
     }
@@ -1976,6 +1979,9 @@ static void ggml_compute_forward_mul_mat_id_pair(
         cpu_dst[pair].src[2] = &filtered_ids;
         cpu_dst[pair].src[3] = NULL;
         ggml_compute_forward_mul_mat_id(params, &cpu_dst[pair]);
+        if (pair == 0) {
+            ggml_barrier(params->threadpool);
+        }
     }
 
     if (ith == 0 && state->route) {
@@ -2015,6 +2021,9 @@ static void ggml_compute_forward_mul_mat_id_pair(
         for (int pair = 0; pair < 2; pair++) {
             filtered_ids.data = state->filtered[pair];
             ggml_compute_forward_mul_mat_id(params, &cpu_dst[pair]);
+            if (pair == 0) {
+                ggml_barrier(params->threadpool);
+            }
         }
     }
 }

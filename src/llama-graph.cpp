@@ -2216,6 +2216,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     } else {
         const bool can_pair_gate_up = gate_exps && !up_exps_s && !gate_exps_s &&
             loras->empty() && !up_exps->extra && !gate_exps->extra &&
+            up_exps->buffer && gate_exps->buffer &&
+            ggml_backend_buffer_is_host(up_exps->buffer) &&
+            ggml_backend_buffer_is_host(gate_exps->buffer) &&
             up_exps->type == gate_exps->type &&
             up_exps->ne[0] == gate_exps->ne[0] &&
             up_exps->ne[1] == gate_exps->ne[1] &&

@@ -85,6 +85,27 @@ The blocker-fix contract is preserved for the whole pair:
 `test-moe-cache` adds fused hit, dispatch-fault, and collect-fault scenarios
 and compares the packed result with a cache-disabled CPU reference.
 
+## Stage A versus Stage B engineering call
+
+Round-4 re-evaluation keeps the Stage B prototype, with its execution
+boundaries tightened, rather than retreating to Stage A:
+
+| Option | Shape | Expected synchronization | Engineering call |
+|---|---|---:|---|
+| Stage A | Traverse ids once, but dispatch/upload/quantize/collect gate and up separately | Gate wait + up wait + down wait | Lower coupling, but it preserves roughly three waits per layer and cannot deliver the prototype's main two-wait target. Planning-only savings are unlikely to justify a second API shape without timing evidence. |
+| Stage B | Share the plan, activation upload and quantization; launch both projections on one stream; collect with one D2H transaction and wait | Combined gate/up wait + down wait | Keep. The rejected corruption came from admitting the CPU-only paired marker to CUDA and omitting a thread barrier between its canonical CPU child projections, not from the shared upload or collection design. |
+
+The repaired boundary constructs the paired node only for host-resident expert
+weights, makes CUDA reject the marker defensively, and separates the two
+canonical CPU child operations with a thread barrier in normal, oversized-
+route bypass, and collect-failure replay paths. A realistic top-10-over-256
+host test compares the packed result against two independent unfused graphs and
+separately rejects unallocated/device-residency pairing. This is a source- and
+off-device-correctness decision, not a performance claim. If the
+next device gate fails inside shared dispatch or collection, fall back to the
+unfused pair; do not ship Stage A unless the three-arm timing discriminator
+shows that planning-only fusion pays for its added ownership surface.
+
 ## Deliberate prototype limits
 
 - Down remains on the legacy per-node cache seam.

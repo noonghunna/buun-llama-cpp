@@ -1490,6 +1490,8 @@ extern "C" {
 
     // paired indirect matrix multiplication. Results are packed as
     // [as0 rows, as1 rows, n_expert_used, n_tokens] along dimension 0.
+    // Returns NULL unless both expert tensors already have host-resident
+    // buffers; device backends do not implement the paired marker.
     GGML_API struct ggml_tensor * ggml_mul_mat_id_pair(
             struct ggml_context * ctx,
             struct ggml_tensor  * as0,

@@ -3523,6 +3523,14 @@ struct ggml_tensor * ggml_mul_mat_id_pair(
     GGML_ASSERT(as0->ne[1] == as1->ne[1]);
     GGML_ASSERT(as0->ne[2] == as1->ne[2]);
     GGML_ASSERT(ids->ne[0] % b->ne[1] == 0);
+    // The paired operation is a CPU-cache seam. Other backends implement the
+    // reused MUL_MAT_ID marker as a single projection and do not consume
+    // src[3], so never construct it for unallocated or device-side weights.
+    if (!as0->buffer || !as1->buffer ||
+        !ggml_backend_buffer_is_host(as0->buffer) ||
+        !ggml_backend_buffer_is_host(as1->buffer)) {
+        return NULL;
+    }
 
     const int64_t ne[4] = {
         as0->ne[1] + as1->ne[1], ids->ne[0], b->ne[2], 1,

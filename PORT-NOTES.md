@@ -238,3 +238,27 @@ verify every `ggml_cuda_moe_cache_mmv` call and the Q2_0/Q2_0_G128 switch arms,
 then compile sm_86 and run the dedicated Q2 tail/last-slot cases before the
 Laguna benchmark. See `docs/moe-cache-fusion/DESIGN.md` for the paired route
 contract and fallback semantics.
+
+## Round-4 fusion output-integrity repair
+
+The third device rejection was reproducible without a GPU using a realistic
+top-10-over-256 routing graph: six skewed hot experts plus four rotating tail
+experts produced 160 distinct slot signatures, while packed projection zero
+disagreed with two independently computed unfused references. Two independent
+boundary defects caused the failure:
+
+| Defect | Repair |
+|---|---|
+| The paired form reuses `GGML_OP_MUL_MAT_ID` with `src[3]` as its marker. CUDA accepted that node but implements only `src[0..2]`, silently calculating one projection into a two-projection result. | Construct the paired node only for host-resident expert buffers, require that residency in the graph predicate, and make CUDA reject paired-marker nodes defensively. |
+| The wrapper invoked both canonical CPU child projections against shared work memory without an inter-projection thread barrier. Fast workers could enter projection one while peers still consumed projection-zero scratch, which explains the projection-zero-only corruption. | Add a barrier between projection zero and projection one in the normal, oversized-route bypass, and collect-failure replay paths. |
+
+The regression suite was committed before the repair. It asserts route spread,
+finite/nonzero/distinct per-slot signatures, both packed projections against
+independent unfused results, and rejection of unallocated/non-host pairing.
+The pre-fix host run failed projection zero and the residency contract; the
+post-fix host run reported both `fused-residency-contract: OK` and
+`fused-output-integrity-10x16x256: OK` with CUDA hidden. Device execution
+remains an owner gate: run the full cache suite repeatedly, the new named
+cases, a
+coherent/nonempty Laguna generation, route-spread telemetry, and both fused
+fault-injection paths before benchmarking.

@@ -4870,6 +4870,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
             {
+                // src[3] marks the CPU MoE-cache paired operation. CUDA's
+                // MUL_MAT_ID implementation consumes only src[0..2], so
+                // accepting it would silently compute one projection into a
+                // two-projection result tensor.
+                if (op->op == GGML_OP_MUL_MAT_ID && op->src[3]) {
+                    return false;
+                }
                 struct ggml_tensor * a = op->src[0];
                 struct ggml_tensor * b = op->src[1];
                 if (a->nb[0] != ggml_element_size(a) || b->nb[0] != ggml_element_size(b)) {
