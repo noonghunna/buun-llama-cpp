@@ -38,12 +38,32 @@ Both the legacy dispatch and paired dispatch compact activation rows by exact
 host pointer identity. Each hit carries a device-side activation index in
 addition to its slot index. `mmvq` uses that index instead of the old
 `hit % act_rows` assumption. This handles partially duplicated multi-token
-routes correctly and is a prerequisite for raising the 64-hit ceiling later.
+routes correctly without uploading the same token activation once per expert hit.
 
 For the paired route, compaction spans both projections, so a gate/up hit pair
 for the same token maps to one uploaded activation row. The device ids scratch
 layout is `[slot indices][activation indices]`; no new allocation class is
 introduced.
+
+## Route ceiling and DFlash sizing
+
+The shared `GGML_MOE_CACHE_MAX_TOPK` compile-time ceiling now defaults to 192.
+It sizes the seven legacy hook arrays, paired-route maps, provider pin/index
+arrays, and linear CUDA scratch reservation. Defining it to 64 at compile time
+retains a comparison arm without changing the public callback layout.
+
+The consumer sizing is source-verified in poolside's read-only DFlash path:
+`common/speculative.cpp` defaults `block_size` to 16, caps the draft at
+`block_size - 1`, and constructs each noise block as `n_draft + 1` tokens. At
+the maximum draft, Laguna's top-10 MoE route therefore carries 10 x 16 = 160
+ids. The runtime default for `GGML_CUDA_MOE_CACHE_MAX_BATCH` remains 1, but its
+accepted range now reaches the compile-time ceiling; the DFlash run must set it
+to 16.
+
+`test-moe-cache` adds a 10 x 16 paired graph with 160 ids and 16 unique token
+activations. It requires at least 160 observed hits while comparing the fused
+output to the cache-disabled CPU reference. The existing fused dispatch- and
+collect-fault cases continue to verify the pair-wide fallback contract.
 
 ## Failure semantics
 

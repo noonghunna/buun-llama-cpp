@@ -243,7 +243,7 @@ struct moe_cache_node {
     int64_t n_expert = 0;
     int wtype = -1;
     std::unique_lock<std::mutex> dispatch_lock;
-    moe_cache_pin pins[64];
+    moe_cache_pin pins[GGML_MOE_CACHE_MAX_TOPK];
     int n_pins = 0;
     bool planned = false;
     bool dispatched = false;
@@ -324,7 +324,9 @@ static moe_cache_config moe_cache_read_config() {
     if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_MIN_EXPERT_KB", 1, 1024 * 1024, value)) {
         config.min_expert_bytes = (size_t)value << 10;
     }
-    if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_MAX_BATCH", 1, 8, value)) {
+    if (moe_cache_env_i64(
+            "GGML_CUDA_MOE_CACHE_MAX_BATCH", 1,
+            GGML_MOE_CACHE_MAX_TOPK, value)) {
         config.max_batch = (int)value;
     }
     if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_INSERTS", 1, 1024, value)) {
@@ -561,7 +563,7 @@ static size_t moe_cache_growth_capacity(size_t capacity, size_t required) {
 
 static bool moe_cache_scratch_requirements(
         int64_t n_in, int64_t n_out, moe_cache_scratch & result) {
-    constexpr size_t max_rows = 64;
+    constexpr size_t max_rows = GGML_MOE_CACHE_MAX_TOPK;
     if (n_in <= 0 || n_out <= 0 ||
         n_in > INT64_MAX - (MATRIX_ROW_PADDING - 1)) {
         return false;
@@ -1579,7 +1581,8 @@ static void * moe_cache_begin(
 static int moe_cache_plan(
         void * opaque, const int32_t * ids, int n_ids, int32_t * slot_indices) {
     moe_cache_node * node = (moe_cache_node *)opaque;
-    if (!node || !ids || !slot_indices || n_ids < 0 || n_ids > 64 || node->planned) {
+    if (!node || !ids || !slot_indices || n_ids < 0 ||
+        n_ids > GGML_MOE_CACHE_MAX_TOPK || node->planned) {
         return 0;
     }
     node->planned = true;
@@ -1805,7 +1808,7 @@ static void * moe_cache_route_begin(
         const ggml_moe_cache_tensor_desc tensors[2],
         const int32_t * ids, int n_ids, int32_t * slot_idx[2]) {
     if (!tensors || !ids || !slot_idx || !slot_idx[0] || !slot_idx[1] ||
-        n_ids < 0 || n_ids > 64 ||
+        n_ids < 0 || n_ids > GGML_MOE_CACHE_MAX_TOPK ||
         tensors[0].n_in != tensors[1].n_in ||
         tensors[0].n_out != tensors[1].n_out ||
         tensors[0].n_expert != tensors[1].n_expert ||
@@ -1884,7 +1887,8 @@ static int moe_cache_dispatch(
         const int32_t * slot_indices, const float * const * act_rows) {
     moe_cache_node * node = (moe_cache_node *)opaque;
     if (!node || !node->planned || node->dispatched || n_hits <= 0 ||
-        n_hits > 64 || n_hits != node->n_pins || !slot_indices || !act_rows ||
+        n_hits > GGML_MOE_CACHE_MAX_TOPK ||
+        n_hits != node->n_pins || !slot_indices || !act_rows ||
         wtype != node->wtype || n_in != node->n_in || n_out != node->n_out ||
         n_in > INT_MAX || n_out > INT_MAX ||
         n_in > INT64_MAX - (MATRIX_ROW_PADDING - 1)) {
@@ -1911,8 +1915,8 @@ static int moe_cache_dispatch(
         }
     }
 
-    const float * unique_acts[64];
-    int32_t act_indices[64];
+    const float * unique_acts[GGML_MOE_CACHE_MAX_TOPK];
+    int32_t act_indices[GGML_MOE_CACHE_MAX_TOPK];
     int activation_rows = 0;
     for (int index = 0; index < n_hits; index++) {
         if (slot_indices[index] < 0 || slot_indices[index] >= pool.n_slots ||
@@ -2070,12 +2074,13 @@ static int moe_cache_route_dispatch(
     }
 
     int total_hits = 0;
-    const float * unique_acts[128];
-    int32_t act_indices[2][64];
+    const float * unique_acts[2 * GGML_MOE_CACHE_MAX_TOPK];
+    int32_t act_indices[2][GGML_MOE_CACHE_MAX_TOPK];
     int activation_rows = 0;
     for (int pair = 0; pair < 2; pair++) {
         const int n_hits = pairs[pair].n_hits;
-        if (n_hits < 0 || n_hits > 64 || n_hits != nodes[pair]->n_pins ||
+        if (n_hits < 0 || n_hits > GGML_MOE_CACHE_MAX_TOPK ||
+            n_hits != nodes[pair]->n_pins ||
             (n_hits > 0 && (!pairs[pair].slot_idx || !pairs[pair].act_rows))) {
             return 0;
         }
@@ -2301,7 +2306,8 @@ static int moe_cache_route_collect(
 static int moe_cache_collect(
         void * opaque, int n_hits, float * const * dst_rows, int64_t n_out) {
     moe_cache_node * node = (moe_cache_node *)opaque;
-    if (!node || !node->dispatched || n_hits <= 0 || n_hits > 64 ||
+    if (!node || !node->dispatched || n_hits <= 0 ||
+        n_hits > GGML_MOE_CACHE_MAX_TOPK ||
         n_hits != node->n_pins || !dst_rows || n_out != node->n_out) {
         return 0;
     }

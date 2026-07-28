@@ -24,6 +24,12 @@ constexpr int64_t n_used    = 2;
 constexpr int64_t n_tokens  = 1;
 constexpr int     max_steps = 160;
 
+constexpr int64_t dflash_top_k     = 10;
+constexpr int64_t dflash_batch     = 16;
+constexpr int64_t dflash_route_ids = dflash_top_k * dflash_batch;
+static_assert(dflash_route_ids <= GGML_MOE_CACHE_MAX_TOPK,
+        "DFlash draft+1 route must fit the MoE cache ceiling");
+
 struct log_capture {
     std::mutex mutex;
     std::condition_variable cv;
@@ -194,13 +200,15 @@ static bool compare_output(
     return squared_error / std::max(squared_reference, 1e-12) <= max_nmse;
 }
 
-static void configure_cache(const char * fail_stage) {
+static void configure_cache(const char * fail_stage, int max_batch = 1) {
     set_env("GGML_CUDA_MOE_CACHE", "1");
     set_env("GGML_CUDA_MOE_CACHE_MODE", "on");
     set_env("GGML_CUDA_MOE_CACHE_BUDGET_MB", "4");
     set_env("GGML_CUDA_MOE_CACHE_RESERVE_MB", "0");
     set_env("GGML_CUDA_MOE_CACHE_MIN_EXPERT_KB", "1");
-    set_env("GGML_CUDA_MOE_CACHE_MAX_BATCH", "1");
+    char max_batch_text[16];
+    snprintf(max_batch_text, sizeof(max_batch_text), "%d", max_batch);
+    set_env("GGML_CUDA_MOE_CACHE_MAX_BATCH", max_batch_text);
     set_env("GGML_CUDA_MOE_CACHE_INSERTS", "4");
     set_env("GGML_CUDA_MOE_CACHE_ADMIT_AFTER", "1");
     set_env("GGML_CUDA_MOE_CACHE_THROTTLE", "1");
@@ -283,8 +291,10 @@ static bool run_scenario(
         ggml_backend_t cpu,
         test_graph & graph,
         const std::vector<float> & reference,
-        log_capture & capture) {
-    configure_cache(fail_stage);
+        log_capture & capture,
+        int cache_max_batch = 1,
+        long long minimum_hits = 1) {
+    configure_cache(fail_stage, cache_max_batch);
     capture.clear();
 
     ggml_backend_t backends[] = { cuda, cpu };
@@ -329,7 +339,7 @@ static bool run_scenario(
     const std::string log = capture.get();
     bool stage_ok = false;
     if (!fail_stage) {
-        stage_ok = has_positive_field(log, "hits=");
+        stage_ok = max_field_value(log, "hits=") >= minimum_hits;
     } else if (strcmp(fail_stage, "dispatch") == 0) {
         stage_ok = has_positive_field(log, "dispatch-fail=");
     } else if (strcmp(fail_stage, "collect") == 0) {
@@ -1335,10 +1345,16 @@ int main() {
             static_ctx, GGML_TYPE_I32, n_used, n_tokens);
     ggml_tensor * activations = ggml_new_tensor_3d(
             static_ctx, GGML_TYPE_F32, n_in, 1, n_tokens);
+    ggml_tensor * dflash_ids = ggml_new_tensor_2d(
+            static_ctx, GGML_TYPE_I32, dflash_top_k, dflash_batch);
+    ggml_tensor * dflash_activations = ggml_new_tensor_3d(
+            static_ctx, GGML_TYPE_F32, n_in, 1, dflash_batch);
     ggml_set_name(weights, "blk.0.ffn_up_exps.weight");
     ggml_set_name(gate_weights, "blk.0.ffn_gate_exps.weight");
     ggml_set_name(ids, "moe_cache_test_ids");
     ggml_set_name(activations, "moe_cache_test_activations");
+    ggml_set_name(dflash_ids, "moe_cache_dflash_ids");
+    ggml_set_name(dflash_activations, "moe_cache_dflash_activations");
 
     ggml_backend_buffer_t static_buffer =
         ggml_backend_alloc_ctx_tensors(static_ctx, cpu);
@@ -1403,6 +1419,24 @@ int main() {
             activations, activation_data.data(), 0,
             activation_data.size() * sizeof(float));
 
+    std::vector<int32_t> dflash_ids_data(dflash_route_ids);
+    for (int64_t index = 0; index < dflash_route_ids; index++) {
+        dflash_ids_data[index] = (int32_t) (index % dflash_top_k);
+    }
+    ggml_backend_tensor_set(
+            dflash_ids, dflash_ids_data.data(), 0,
+            dflash_ids_data.size() * sizeof(dflash_ids_data[0]));
+    std::vector<float> dflash_activation_data(
+            ggml_nelements(dflash_activations));
+    for (size_t index = 0; index < dflash_activation_data.size(); index++) {
+        dflash_activation_data[index] =
+            0.31f * std::sin((float) index * 0.059f) -
+            0.19f * std::cos((float) index * 0.097f);
+    }
+    ggml_backend_tensor_set(
+            dflash_activations, dflash_activation_data.data(), 0,
+            dflash_activation_data.size() * sizeof(float));
+
     test_graph graph = make_graph(cpu, weights, activations, ids);
     if (!graph.ctx || !graph.buffer) {
         fprintf(stderr, "failed to create test graph\n");
@@ -1444,6 +1478,24 @@ int main() {
             pair_graph.out, pair_reference.data(), 0,
             pair_reference.size() * sizeof(float));
 
+    test_graph dflash_pair_graph = make_pair_graph(
+            cpu, weights, gate_weights, dflash_activations, dflash_ids);
+    if (!dflash_pair_graph.ctx || !dflash_pair_graph.buffer) {
+        fprintf(stderr, "failed to create DFlash-shaped paired test graph\n");
+        return 1;
+    }
+    set_env("GGML_CUDA_MOE_CACHE", "0");
+    if (ggml_backend_graph_compute(cpu, dflash_pair_graph.graph) !=
+            GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "DFlash-shaped paired CPU reference compute failed\n");
+        return 1;
+    }
+    std::vector<float> dflash_pair_reference(
+            ggml_nelements(dflash_pair_graph.out));
+    ggml_backend_tensor_get(
+            dflash_pair_graph.out, dflash_pair_reference.data(), 0,
+            dflash_pair_reference.size() * sizeof(float));
+
     bool ok = true;
     ok &= run_scenario("cache-hit", nullptr, cuda, cpu, graph, reference, capture);
     ok &= run_scenario("dispatch-fallback", "dispatch", cuda, cpu, graph, reference, capture);
@@ -1456,6 +1508,9 @@ int main() {
             "fused-dispatch-fallback", "dispatch", cuda, cpu, pair_graph, pair_reference, capture);
     ok &= run_scenario(
             "fused-collect-fallback", "collect", cuda, cpu, pair_graph, pair_reference, capture);
+    ok &= run_scenario(
+            "fused-dflash-10x16", nullptr, cuda, cpu, dflash_pair_graph,
+            dflash_pair_reference, capture, dflash_batch, dflash_route_ids);
     const size_t expert_size = ggml_nbytes(weights) / n_expert;
     ok &= run_precensus_invalidation(
             cuda, cpu, graph, weights,
@@ -1510,6 +1565,7 @@ int main() {
     ok &= run_route_override(cuda_device, cuda, cpu);
     ok &= run_admission_policy(cuda, cpu, capture);
 
+    free_graph(dflash_pair_graph);
     free_graph(pair_graph);
     free_graph(graph);
     ggml_backend_free(cuda);

@@ -1598,16 +1598,15 @@ static void ggml_compute_forward_mul_mat_id(
     const int n_as  = ne02;       // n_expert
 
     // MoE expert cache state is used by thread 0 only.
-    enum { MOE_CACHE_MAX_TOPK = 64 };
     void *        moe_cache_node = NULL;
     int           moe_cache_n_hits = 0;
-    int32_t       moe_cache_slot_idx[MOE_CACHE_MAX_TOPK];
-    int32_t       moe_cache_compact[MOE_CACHE_MAX_TOPK];
-    int32_t       moe_cache_experts[MOE_CACHE_MAX_TOPK];
-    int32_t       moe_cache_ids[MOE_CACHE_MAX_TOPK];
-    int32_t       moe_cache_tokens[MOE_CACHE_MAX_TOPK];
-    const float * moe_cache_acts[MOE_CACHE_MAX_TOPK];
-    float *       moe_cache_rows[MOE_CACHE_MAX_TOPK];
+    int32_t       moe_cache_slot_idx[GGML_MOE_CACHE_MAX_TOPK];
+    int32_t       moe_cache_compact[GGML_MOE_CACHE_MAX_TOPK];
+    int32_t       moe_cache_experts[GGML_MOE_CACHE_MAX_TOPK];
+    int32_t       moe_cache_ids[GGML_MOE_CACHE_MAX_TOPK];
+    int32_t       moe_cache_tokens[GGML_MOE_CACHE_MAX_TOPK];
+    const float * moe_cache_acts[GGML_MOE_CACHE_MAX_TOPK];
+    float *       moe_cache_rows[GGML_MOE_CACHE_MAX_TOPK];
 
     void * wdata_cur = params->wdata;
 
@@ -1671,11 +1670,11 @@ static void ggml_compute_forward_mul_mat_id(
             src0->op == GGML_OP_NONE && src0_buffer &&
             ggml_backend_buffer_get_usage(src0_buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
             src1->type == GGML_TYPE_F32 &&
-            n_ids * ids->ne[1] <= MOE_CACHE_MAX_TOPK) {
+            ids->ne[1] <= GGML_MOE_CACHE_MAX_TOPK / n_ids) {
             moe_cache_node = ggml_moe_cache.begin(src0->name, src0->data, nb02,
                                                   ne00, ne01, (int) type, ne02, ids->ne[1]);
             if (moe_cache_node) {
-                int32_t expert_ids[MOE_CACHE_MAX_TOPK];
+                int32_t expert_ids[GGML_MOE_CACHE_MAX_TOPK];
                 for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
                     for (int id = 0; id < n_ids; ++id) {
                         expert_ids[iid1*n_ids + id] = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
@@ -1831,9 +1830,9 @@ static void ggml_compute_forward_mul_mat_id(
 
 struct ggml_mmid_pair_state {
     void * route;
-    int32_t original[64];
-    int32_t filtered[2][64];
-    int32_t slots[2][64];
+    int32_t original[GGML_MOE_CACHE_MAX_TOPK];
+    int32_t filtered[2][GGML_MOE_CACHE_MAX_TOPK];
+    int32_t slots[2][GGML_MOE_CACHE_MAX_TOPK];
     int n_ids;
     int n_hits[2];
     int collect_failed;
@@ -1846,10 +1845,11 @@ static void ggml_compute_forward_mul_mat_id_pair(
     struct ggml_tensor * src1 = dst->src[1];
     const struct ggml_tensor * ids = dst->src[2];
     const int ith = params->ith;
-    const int total_ids = (int)(ids->ne[0] * ids->ne[1]);
+    GGML_ASSERT(ids->ne[0] > 0 &&
+                ids->ne[1] <= GGML_MOE_CACHE_MAX_TOPK / ids->ne[0]);
+    const int total_ids = (int) (ids->ne[0] * ids->ne[1]);
     const int64_t n_out = weights[0]->ne[1];
     GGML_ASSERT(weights[1] && weights[1]->ne[1] == n_out);
-    GGML_ASSERT(total_ids <= 64);
 
     uintptr_t state_address =
         (uintptr_t)((char *)params->wdata + params->wsize -
@@ -1898,8 +1898,8 @@ static void ggml_compute_forward_mul_mat_id_pair(
                 tensors, state->original, total_ids, slot_maps);
         }
         if (state->route) {
-            int32_t compact_slots[2][64];
-            const float * hit_acts[2][64];
+            int32_t compact_slots[2][GGML_MOE_CACHE_MAX_TOPK];
+            const float * hit_acts[2][GGML_MOE_CACHE_MAX_TOPK];
             for (int pair = 0; pair < 2; pair++) {
                 for (int index = 0; index < total_ids; index++) {
                     if (state->slots[pair][index] < 0) {
@@ -1952,7 +1952,7 @@ static void ggml_compute_forward_mul_mat_id_pair(
     }
 
     if (ith == 0 && state->route) {
-        float * dst_rows[2][64];
+        float * dst_rows[2][GGML_MOE_CACHE_MAX_TOPK];
         int seen[2] = {0, 0};
         for (int pair = 0; pair < 2; pair++) {
             for (int index = 0; index < total_ids; index++) {

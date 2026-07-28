@@ -3,6 +3,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifndef GGML_MOE_CACHE_MAX_TOPK
+#define GGML_MOE_CACHE_MAX_TOPK 192
+#endif
+
+#if GGML_MOE_CACHE_MAX_TOPK < 1
+#error "GGML_MOE_CACHE_MAX_TOPK must be positive"
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
