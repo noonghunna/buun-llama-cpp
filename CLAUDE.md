@@ -1,5 +1,7 @@
 # CLAUDE.md
 
+
+> **Fork process note:** before working in THIS fork (noonghunna), read [`AGENTS.md`](./AGENTS.md) — branch model, delta manifest, sync rules. This file below is upstream (buun's) codebase guidance and is kept unmodified apart from this note.
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## What This Is

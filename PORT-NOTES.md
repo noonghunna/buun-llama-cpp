@@ -198,3 +198,7 @@ left in place. Recommended owner-run validation order remains:
 3. Run short-prompt and loaded-context Turbo4 cache ON/OFF pairs.
 4. Sweep explicit placement/budget combinations only after correctness is
    established.
+
+| Delta | Why | Upstream status |
+|---|---|---|
+| `AGENTS.md` (new) + 3-line pointer prepended to upstream `CLAUDE.md` | fork process contract for agents (policy #10 distillation); pointer keeps single-discovery-path — CLAUDE.md remains buun's content otherwise | ours (never upstreamed; drop pointer if buun adds his own AGENTS.md) |
