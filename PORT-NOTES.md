@@ -206,6 +206,16 @@ left in place. Recommended owner-run validation order remains:
 
 ## Round-2 fusion branch conflict warning
 
+The rejected device gate exposed a ceiling/admission coupling in the first
+fusion prototype: raising the hook-array ceiling from 64 to 192 also reserved
+192 rows of CUDA scratch for every legacy `begin`, which made the narrow
+8 MiB route-override and 64-slot admission fixtures ineligible. Meanwhile a
+paired route could dispatch twice its per-projection id count. The follow-up
+keeps `begin` source-compatible at its original 64-row reservation, appends
+`begin_rows` for the CPU caller's actual route size, and reserves `2 * n_ids`
+for paired dispatch. This restores legacy admission while protecting the
+fused DFlash transaction's full scratch headroom.
+
 The separate `moe-cache-fusion` prototype intentionally edits
 `ggml/src/ggml-cuda/mmvq.cu` and `mmvq.cuh` again. These are the highest-risk
 files when applying its plain diff to the leloch tree: the patch adds a

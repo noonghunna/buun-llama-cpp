@@ -48,9 +48,13 @@ introduced.
 ## Route ceiling and DFlash sizing
 
 The shared `GGML_MOE_CACHE_MAX_TOPK` compile-time ceiling now defaults to 192.
-It sizes the seven legacy hook arrays, paired-route maps, provider pin/index
-arrays, and linear CUDA scratch reservation. Defining it to 64 at compile time
-retains a comparison arm without changing the public callback layout.
+It sizes the seven legacy hook arrays, paired-route maps, and provider
+pin/index arrays. Scratch admission is route-sized rather than ceiling-sized:
+the appended `begin_rows` callback reserves the actual legacy route size, and
+the paired path reserves `2 * n_ids` for its combined dispatch. The original
+`begin` callback remains intact and retains its pre-fusion 64-row reservation.
+Defining the ceiling to 64 at compile time therefore remains a comparison arm
+without changing the legacy callback contract.
 
 The consumer sizing is source-verified in poolside's read-only DFlash path:
 `common/speculative.cpp` defaults `block_size` to 16, caps the draft at
@@ -89,8 +93,8 @@ and compares the packed result with a cache-disabled CPU reference.
 - The canonical CPU miss path is invoked twice, so activation conversion on
   CPU is not yet shared. The CUDA hit path is the mechanism under test.
 - Route scratch growth is checked against the existing session budget at
-  dispatch. A future production version can reserve the paired maximum during
-  census to remove that late growth decision.
+  dispatch, with the actual single or paired route maximum reserved during
+  census so pool allocation cannot consume that headroom.
 - The public operation marker uses `src[3]` rather than adding an enum value;
   this keeps scheduler/backend plumbing small for the prototype.
 

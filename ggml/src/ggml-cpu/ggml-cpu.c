@@ -1671,8 +1671,14 @@ static void ggml_compute_forward_mul_mat_id(
             ggml_backend_buffer_get_usage(src0_buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
             src1->type == GGML_TYPE_F32 &&
             ids->ne[1] <= GGML_MOE_CACHE_MAX_TOPK / n_ids) {
-            moe_cache_node = ggml_moe_cache.begin(src0->name, src0->data, nb02,
-                                                  ne00, ne01, (int) type, ne02, ids->ne[1]);
+            const int64_t route_rows = n_ids * ids->ne[1];
+            moe_cache_node = ggml_moe_cache.begin_rows
+                ? ggml_moe_cache.begin_rows(
+                    src0->name, src0->data, nb02, ne00, ne01, (int) type,
+                    ne02, ids->ne[1], route_rows)
+                : ggml_moe_cache.begin(
+                    src0->name, src0->data, nb02, ne00, ne01, (int) type,
+                    ne02, ids->ne[1]);
             if (moe_cache_node) {
                 int32_t expert_ids[GGML_MOE_CACHE_MAX_TOPK];
                 for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {

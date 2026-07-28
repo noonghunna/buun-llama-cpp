@@ -98,6 +98,14 @@ struct ggml_moe_cache_api {
             void * route, const struct ggml_moe_cache_result_desc pairs[2]);
 
     void (*route_end)(void * route);
+
+    // Sized extension of begin(). n_route_rows is the maximum number of hit
+    // rows this node may dispatch. Providers predating this callback retain
+    // the legacy 64-row reservation through begin().
+    void * (*begin_rows)(
+            const char * tensor_name, const void * host_base, size_t expert_size,
+            int64_t n_in, int64_t n_out, int wtype, int64_t n_expert,
+            int64_t n_tokens, int64_t n_route_rows);
 };
 
 extern struct ggml_moe_cache_api ggml_moe_cache;

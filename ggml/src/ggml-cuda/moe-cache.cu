@@ -562,12 +562,14 @@ static size_t moe_cache_growth_capacity(size_t capacity, size_t required) {
 }
 
 static bool moe_cache_scratch_requirements(
-        int64_t n_in, int64_t n_out, moe_cache_scratch & result) {
-    constexpr size_t max_rows = GGML_MOE_CACHE_MAX_TOPK;
-    if (n_in <= 0 || n_out <= 0 ||
+        int64_t n_in, int64_t n_out, int64_t n_route_rows,
+        moe_cache_scratch & result) {
+    if (n_in <= 0 || n_out <= 0 || n_route_rows <= 0 ||
+        n_route_rows > 2 * GGML_MOE_CACHE_MAX_TOPK ||
         n_in > INT64_MAX - (MATRIX_ROW_PADDING - 1)) {
         return false;
     }
+    const size_t max_rows = (size_t)n_route_rows;
     const int64_t padded_n_in =
         ((n_in + MATRIX_ROW_PADDING - 1) / MATRIX_ROW_PADDING) * MATRIX_ROW_PADDING;
     if ((uint64_t)n_in > SIZE_MAX / (max_rows * sizeof(float)) ||
@@ -1313,9 +1315,10 @@ static void moe_cache_session_leave(void * opaque) {
     }
 }
 
-static void * moe_cache_begin(
+static void * moe_cache_begin_impl(
         const char * name, const void * host_base, size_t expert_size,
-        int64_t n_in, int64_t n_out, int wtype, int64_t n_expert, int64_t n_tokens) {
+        int64_t n_in, int64_t n_out, int wtype, int64_t n_expert,
+        int64_t n_tokens, int64_t n_route_rows) {
     if (g_session_suppressed > 0 || g_session_stack.empty()) {
         return nullptr;
     }
@@ -1339,7 +1342,7 @@ static void * moe_cache_begin(
     const size_t tensor_size = (size_t)n_expert * expert_size;
     moe_cache_scratch scratch_requirements;
     if (!moe_cache_scratch_requirements(
-            n_in, n_out, scratch_requirements)) {
+            n_in, n_out, n_route_rows, scratch_requirements)) {
         return nullptr;
     }
 
@@ -1576,6 +1579,26 @@ static void * moe_cache_begin(
     node->wtype = wtype;
     node->dispatch_lock = std::move(dispatch_lock);
     return node.release();
+}
+
+static void * moe_cache_begin(
+        const char * name, const void * host_base, size_t expert_size,
+        int64_t n_in, int64_t n_out, int wtype, int64_t n_expert,
+        int64_t n_tokens) {
+    // Preserve the pre-fusion admission contract for callers that only know
+    // the legacy callback. The legacy hook arrays were capped at 64 rows.
+    return moe_cache_begin_impl(
+            name, host_base, expert_size, n_in, n_out, wtype, n_expert,
+            n_tokens, 64);
+}
+
+static void * moe_cache_begin_rows(
+        const char * name, const void * host_base, size_t expert_size,
+        int64_t n_in, int64_t n_out, int wtype, int64_t n_expert,
+        int64_t n_tokens, int64_t n_route_rows) {
+    return moe_cache_begin_impl(
+            name, host_base, expert_size, n_in, n_out, wtype, n_expert,
+            n_tokens, n_route_rows);
 }
 
 static int moe_cache_plan(
@@ -1817,19 +1840,20 @@ static void * moe_cache_route_begin(
     }
 
     moe_cache_node * nodes[2] = {nullptr, nullptr};
-    nodes[0] = (moe_cache_node *)moe_cache_begin(
+    const int64_t paired_route_rows = 2 * (int64_t)n_ids;
+    nodes[0] = (moe_cache_node *)moe_cache_begin_impl(
             tensors[0].name, tensors[0].host_base, tensors[0].expert_size,
             tensors[0].n_in, tensors[0].n_out, tensors[0].wtype,
-            tensors[0].n_expert, tensors[0].n_tokens);
+            tensors[0].n_expert, tensors[0].n_tokens, paired_route_rows);
     if (!nodes[0]) {
         return nullptr;
     }
     // The route, not either child, owns the one device dispatch exclusion.
     nodes[0]->dispatch_lock.unlock();
-    nodes[1] = (moe_cache_node *)moe_cache_begin(
+    nodes[1] = (moe_cache_node *)moe_cache_begin_impl(
             tensors[1].name, tensors[1].host_base, tensors[1].expert_size,
             tensors[1].n_in, tensors[1].n_out, tensors[1].wtype,
-            tensors[1].n_expert, tensors[1].n_tokens);
+            tensors[1].n_expert, tensors[1].n_tokens, paired_route_rows);
     if (!nodes[1] || nodes[0]->session != nodes[1]->session ||
         nodes[0]->device != nodes[1]->device) {
         moe_cache_end(nodes[1]);
@@ -2574,6 +2598,7 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.session_enter = moe_cache_session_enter;
     ggml_moe_cache.session_leave = moe_cache_session_leave;
     ggml_moe_cache.begin = moe_cache_begin;
+    ggml_moe_cache.begin_rows = moe_cache_begin_rows;
     ggml_moe_cache.plan = moe_cache_plan;
     ggml_moe_cache.dispatch = moe_cache_dispatch;
     ggml_moe_cache.collect = moe_cache_collect;
