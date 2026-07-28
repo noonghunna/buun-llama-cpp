@@ -1849,13 +1849,34 @@ static void ggml_compute_forward_mul_mat_id_pair(
         struct ggml_tensor * dst) {
     const struct ggml_tensor * weights[2] = {dst->src[0], dst->src[3]};
     struct ggml_tensor * src1 = dst->src[1];
-    const struct ggml_tensor * ids = dst->src[2];
+    struct ggml_tensor * ids = dst->src[2];
     const int ith = params->ith;
-    GGML_ASSERT(ids->ne[0] > 0 &&
-                ids->ne[1] <= GGML_MOE_CACHE_MAX_TOPK / ids->ne[0]);
-    const int total_ids = (int) (ids->ne[0] * ids->ne[1]);
+    GGML_ASSERT(ids->ne[0] > 0);
     const int64_t n_out = weights[0]->ne[1];
     GGML_ASSERT(weights[1] && weights[1]->ne[1] == n_out);
+
+    // Cache limits are a bypass condition, not a tensor-shape invariant.
+    // Prefill and high-concurrency batches may legitimately exceed the
+    // fixed route arrays; preserve the original two-node CPU semantics.
+    if (ids->ne[1] > GGML_MOE_CACHE_MAX_TOPK / ids->ne[0]) {
+        struct ggml_tensor cpu_weights[2] = {*weights[0], *weights[1]};
+        struct ggml_tensor cpu_dst[2] = {*dst, *dst};
+        for (int pair = 0; pair < 2; pair++) {
+            // Prevent the canonical child operation from entering the legacy
+            // cache hook after the paired route has deliberately bypassed it.
+            cpu_weights[pair].op = GGML_OP_VIEW;
+            cpu_dst[pair].data = (char *)dst->data + pair * n_out * sizeof(float);
+            cpu_dst[pair].ne[0] = n_out;
+            cpu_dst[pair].src[0] = &cpu_weights[pair];
+            cpu_dst[pair].src[1] = src1;
+            cpu_dst[pair].src[2] = ids;
+            cpu_dst[pair].src[3] = NULL;
+            ggml_compute_forward_mul_mat_id(params, &cpu_dst[pair]);
+        }
+        return;
+    }
+
+    const int total_ids = (int) (ids->ne[0] * ids->ne[1]);
 
     uintptr_t state_address =
         (uintptr_t)((char *)params->wdata + params->wsize -

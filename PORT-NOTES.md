@@ -216,6 +216,16 @@ keeps `begin` source-compatible at its original 64-row reservation, appends
 for paired dispatch. This restores legacy admission while protecting the
 fused DFlash transaction's full scratch headroom.
 
+The second device rejection found a separate shape-semantics regression: the
+paired CPU hook asserted that every route fit its fixed arrays, while the legacy
+operation treats that ceiling as cache eligibility and computes oversized
+prefill batches on CPU. The repair sends each projection through the canonical
+CPU `mul_mat_id` worker when `n_used * n_tokens` exceeds the cache ceiling,
+retaining the paired output layout and per-projection fallback semantics. The
+dedicated test now covers a `2 x 2048` route and reports an explicit comma-
+separated case list on every aggregate nonzero exit, so another intermittent
+device failure cannot appear as an unnamed all-OK run.
+
 The separate `moe-cache-fusion` prototype intentionally edits
 `ggml/src/ggml-cuda/mmvq.cu` and `mmvq.cuh` again. These are the highest-risk
 files when applying its plain diff to the leloch tree: the patch adds a

@@ -30,6 +30,14 @@ constexpr int64_t dflash_route_ids = dflash_top_k * dflash_batch;
 static_assert(dflash_route_ids <= GGML_MOE_CACHE_MAX_TOPK,
         "DFlash draft+1 route must fit the MoE cache ceiling");
 
+constexpr int64_t prefill_n_in     = 32;
+constexpr int64_t prefill_n_out    = 8;
+constexpr int64_t prefill_n_expert = 4;
+constexpr int64_t prefill_n_used   = 2;
+constexpr int64_t prefill_n_tokens = 2048;
+static_assert(prefill_n_used * prefill_n_tokens > GGML_MOE_CACHE_MAX_TOPK,
+        "prefill fixture must exercise the paired-route bypass");
+
 struct log_capture {
     std::mutex mutex;
     std::condition_variable cv;
@@ -354,6 +362,51 @@ static bool run_scenario(
     }
     printf("%s: %s\n", name, output_ok && stage_ok ? "OK" : "FAIL");
     return output_ok && stage_ok;
+}
+
+static bool run_bypass_scenario(
+        const char * name,
+        ggml_backend_t cuda,
+        ggml_backend_t cpu,
+        test_graph & graph,
+        const std::vector<float> & reference) {
+    configure_cache(nullptr);
+
+    ggml_backend_t backends[] = { cuda, cpu };
+    ggml_backend_sched_t scheduler = ggml_backend_sched_new(
+            backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, false);
+    if (!scheduler) {
+        fprintf(stderr, "%s: failed to create scheduler\n", name);
+        return false;
+    }
+    ggml_backend_sched_set_tensor_backend(scheduler, graph.out, cpu);
+    if (!ggml_backend_sched_alloc_graph(scheduler, graph.graph) ||
+        ggml_backend_sched_get_tensor_backend(scheduler, graph.out) != cpu) {
+        fprintf(stderr, "%s: paired op was not assigned to CPU\n", name);
+        ggml_backend_sched_free(scheduler);
+        return false;
+    }
+
+    bool ok = true;
+    const enum ggml_status status =
+        ggml_backend_sched_graph_compute(scheduler, graph.graph);
+    if (status != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "%s: graph compute failed: %s\n",
+                name, ggml_status_to_string(status));
+        ok = false;
+    } else {
+        std::vector<float> actual(reference.size());
+        ggml_backend_tensor_get(
+                graph.out, actual.data(), 0, actual.size() * sizeof(float));
+        if (!compare_output(reference, actual, 5e-4)) {
+            fprintf(stderr, "%s: output mismatch\n", name);
+            ok = false;
+        }
+    }
+
+    ggml_backend_sched_free(scheduler);
+    printf("%s: %s\n", name, ok ? "OK" : "FAIL");
+    return ok;
 }
 
 static bool run_invalidation_scenario(
@@ -1315,7 +1368,7 @@ int main() {
     ggml_backend_t cuda = ggml_backend_dev_init(cuda_device, nullptr);
     ggml_backend_t cpu = init_cpu_backend();
     if (!cuda || !cpu) {
-        fprintf(stderr, "failed to initialize CUDA and CPU backends\n");
+        fprintf(stderr, "test-moe-cache-setup: failed to initialize CUDA and CPU backends\n");
         if (cuda) {
             ggml_backend_free(cuda);
         }
@@ -1325,13 +1378,13 @@ int main() {
         return 1;
     }
     ggml_init_params static_params = {
-        8 * ggml_tensor_overhead(),
+        16 * ggml_tensor_overhead(),
         nullptr,
         true,
     };
     ggml_context * static_ctx = ggml_init(static_params);
     if (!static_ctx) {
-        fprintf(stderr, "failed to create tensor context\n");
+        fprintf(stderr, "test-moe-cache-setup: failed to create tensor context\n");
         ggml_backend_free(cuda);
         ggml_backend_free(cpu);
         return 1;
@@ -1349,17 +1402,29 @@ int main() {
             static_ctx, GGML_TYPE_I32, dflash_top_k, dflash_batch);
     ggml_tensor * dflash_activations = ggml_new_tensor_3d(
             static_ctx, GGML_TYPE_F32, n_in, 1, dflash_batch);
+    ggml_tensor * prefill_weights = ggml_new_tensor_3d(
+            static_ctx, GGML_TYPE_F32, prefill_n_in, prefill_n_out, prefill_n_expert);
+    ggml_tensor * prefill_gate_weights = ggml_new_tensor_3d(
+            static_ctx, GGML_TYPE_F32, prefill_n_in, prefill_n_out, prefill_n_expert);
+    ggml_tensor * prefill_ids = ggml_new_tensor_2d(
+            static_ctx, GGML_TYPE_I32, prefill_n_used, prefill_n_tokens);
+    ggml_tensor * prefill_activations = ggml_new_tensor_3d(
+            static_ctx, GGML_TYPE_F32, prefill_n_in, 1, prefill_n_tokens);
     ggml_set_name(weights, "blk.0.ffn_up_exps.weight");
     ggml_set_name(gate_weights, "blk.0.ffn_gate_exps.weight");
     ggml_set_name(ids, "moe_cache_test_ids");
     ggml_set_name(activations, "moe_cache_test_activations");
     ggml_set_name(dflash_ids, "moe_cache_dflash_ids");
     ggml_set_name(dflash_activations, "moe_cache_dflash_activations");
+    ggml_set_name(prefill_weights, "blk.6.ffn_up_exps.weight");
+    ggml_set_name(prefill_gate_weights, "blk.6.ffn_gate_exps.weight");
+    ggml_set_name(prefill_ids, "moe_cache_prefill_ids");
+    ggml_set_name(prefill_activations, "moe_cache_prefill_activations");
 
     ggml_backend_buffer_t static_buffer =
         ggml_backend_alloc_ctx_tensors(static_ctx, cpu);
     if (!static_buffer) {
-        fprintf(stderr, "failed to allocate CPU tensors\n");
+        fprintf(stderr, "test-moe-cache-setup: failed to allocate CPU tensors\n");
         ggml_free(static_ctx);
         ggml_backend_free(cuda);
         ggml_backend_free(cpu);
@@ -1379,7 +1444,7 @@ int main() {
             GGML_TYPE_Q4_0, weights_f32.data(), weights_q4.data(),
             0, n_out * n_expert, n_in, nullptr);
     if (quantized != weights_q4.size()) {
-        fprintf(stderr, "unexpected quantized size: %zu != %zu\n",
+        fprintf(stderr, "test-moe-cache-setup: unexpected quantized size: %zu != %zu\n",
                 quantized, weights_q4.size());
         ggml_backend_buffer_free(static_buffer);
         ggml_free(static_ctx);
@@ -1401,7 +1466,7 @@ int main() {
             GGML_TYPE_Q4_0, gate_f32.data(), gate_q4.data(),
             0, n_out * n_expert, n_in, nullptr);
     if (gate_quantized != gate_q4.size()) {
-        fprintf(stderr, "unexpected paired gate quantized size\n");
+        fprintf(stderr, "test-moe-cache-setup: unexpected paired gate quantized size\n");
         return 1;
     }
     ggml_backend_tensor_set(
@@ -1437,9 +1502,53 @@ int main() {
             dflash_activations, dflash_activation_data.data(), 0,
             dflash_activation_data.size() * sizeof(float));
 
+    std::vector<float> prefill_weights_data(ggml_nelements(prefill_weights));
+    for (size_t index = 0; index < prefill_weights_data.size(); index++) {
+        prefill_weights_data[index] =
+            0.08f * std::sin((float) (index % 251) * 0.043f) +
+            0.03f * std::cos((float) (index % 127) * 0.071f);
+    }
+    ggml_backend_tensor_set(
+            prefill_weights, prefill_weights_data.data(), 0,
+            prefill_weights_data.size() * sizeof(float));
+
+    std::vector<float> prefill_gate_weights_data(
+            ggml_nelements(prefill_gate_weights));
+    for (size_t index = 0; index < prefill_gate_weights_data.size(); index++) {
+        prefill_gate_weights_data[index] =
+            -0.06f * std::sin((float) (index % 239) * 0.047f) +
+             0.04f * std::cos((float) (index % 113) * 0.067f);
+    }
+    ggml_backend_tensor_set(
+            prefill_gate_weights, prefill_gate_weights_data.data(), 0,
+            prefill_gate_weights_data.size() * sizeof(float));
+
+    std::vector<int32_t> prefill_ids_data(
+            prefill_n_used * prefill_n_tokens);
+    for (int64_t token = 0; token < prefill_n_tokens; token++) {
+        for (int64_t used = 0; used < prefill_n_used; used++) {
+            prefill_ids_data[token * prefill_n_used + used] =
+                (int32_t) ((token + used) % prefill_n_expert);
+        }
+    }
+    ggml_backend_tensor_set(
+            prefill_ids, prefill_ids_data.data(), 0,
+            prefill_ids_data.size() * sizeof(prefill_ids_data[0]));
+
+    std::vector<float> prefill_activation_data(
+            ggml_nelements(prefill_activations));
+    for (size_t index = 0; index < prefill_activation_data.size(); index++) {
+        prefill_activation_data[index] =
+            0.17f * std::sin((float) index * 0.013f) -
+            0.09f * std::cos((float) index * 0.019f);
+    }
+    ggml_backend_tensor_set(
+            prefill_activations, prefill_activation_data.data(), 0,
+            prefill_activation_data.size() * sizeof(float));
+
     test_graph graph = make_graph(cpu, weights, activations, ids);
     if (!graph.ctx || !graph.buffer) {
-        fprintf(stderr, "failed to create test graph\n");
+        fprintf(stderr, "cache-hit-reference-setup: failed to create test graph\n");
         free_graph(graph);
         ggml_backend_buffer_free(static_buffer);
         ggml_free(static_ctx);
@@ -1450,7 +1559,7 @@ int main() {
 
     set_env("GGML_CUDA_MOE_CACHE", "0");
     if (ggml_backend_graph_compute(cpu, graph.graph) != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "CPU reference compute failed\n");
+        fprintf(stderr, "cache-hit-reference-setup: CPU reference compute failed\n");
         free_graph(graph);
         ggml_backend_buffer_free(static_buffer);
         ggml_free(static_ctx);
@@ -1465,12 +1574,12 @@ int main() {
     test_graph pair_graph = make_pair_graph(
             cpu, weights, gate_weights, activations, ids);
     if (!pair_graph.ctx || !pair_graph.buffer) {
-        fprintf(stderr, "failed to create paired test graph\n");
+        fprintf(stderr, "fused-cache-hit-reference-setup: failed to create paired test graph\n");
         return 1;
     }
     set_env("GGML_CUDA_MOE_CACHE", "0");
     if (ggml_backend_graph_compute(cpu, pair_graph.graph) != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "paired CPU reference compute failed\n");
+        fprintf(stderr, "fused-cache-hit-reference-setup: paired CPU reference compute failed\n");
         return 1;
     }
     std::vector<float> pair_reference(ggml_nelements(pair_graph.out));
@@ -1481,13 +1590,13 @@ int main() {
     test_graph dflash_pair_graph = make_pair_graph(
             cpu, weights, gate_weights, dflash_activations, dflash_ids);
     if (!dflash_pair_graph.ctx || !dflash_pair_graph.buffer) {
-        fprintf(stderr, "failed to create DFlash-shaped paired test graph\n");
+        fprintf(stderr, "fused-dflash-10x16-reference-setup: failed to create test graph\n");
         return 1;
     }
     set_env("GGML_CUDA_MOE_CACHE", "0");
     if (ggml_backend_graph_compute(cpu, dflash_pair_graph.graph) !=
             GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "DFlash-shaped paired CPU reference compute failed\n");
+        fprintf(stderr, "fused-dflash-10x16-reference-setup: CPU reference compute failed\n");
         return 1;
     }
     std::vector<float> dflash_pair_reference(
@@ -1496,33 +1605,74 @@ int main() {
             dflash_pair_graph.out, dflash_pair_reference.data(), 0,
             dflash_pair_reference.size() * sizeof(float));
 
+    test_graph prefill_pair_graph = make_pair_graph(
+            cpu, prefill_weights, prefill_gate_weights,
+            prefill_activations, prefill_ids);
+    if (!prefill_pair_graph.ctx || !prefill_pair_graph.buffer) {
+        fprintf(stderr,
+                "fused-prefill-bypass-2x2048: failed to create test graph\n");
+        return 1;
+    }
+    set_env("GGML_CUDA_MOE_CACHE", "0");
+    if (ggml_backend_graph_compute(cpu, prefill_pair_graph.graph) !=
+            GGML_STATUS_SUCCESS) {
+        fprintf(stderr,
+                "fused-prefill-bypass-2x2048: CPU reference compute failed\n");
+        return 1;
+    }
+    std::vector<float> prefill_pair_reference(
+            ggml_nelements(prefill_pair_graph.out));
+    ggml_backend_tensor_get(
+            prefill_pair_graph.out, prefill_pair_reference.data(), 0,
+            prefill_pair_reference.size() * sizeof(float));
+
     bool ok = true;
-    ok &= run_scenario("cache-hit", nullptr, cuda, cpu, graph, reference, capture);
-    ok &= run_scenario("dispatch-fallback", "dispatch", cuda, cpu, graph, reference, capture);
-    ok &= run_scenario("collect-fallback", "collect", cuda, cpu, graph, reference, capture);
-    ok &= run_scenario("insert-fallback", "insert", cuda, cpu, graph, reference, capture);
-    ok &= run_scenario("slab-fallback", "slab", cuda, cpu, graph, reference, capture);
-    ok &= run_scenario(
-            "fused-cache-hit", nullptr, cuda, cpu, pair_graph, pair_reference, capture);
-    ok &= run_scenario(
-            "fused-dispatch-fallback", "dispatch", cuda, cpu, pair_graph, pair_reference, capture);
-    ok &= run_scenario(
-            "fused-collect-fallback", "collect", cuda, cpu, pair_graph, pair_reference, capture);
-    ok &= run_scenario(
-            "fused-dflash-10x16", nullptr, cuda, cpu, dflash_pair_graph,
-            dflash_pair_reference, capture, dflash_batch, dflash_route_ids);
+    std::vector<std::string> failed_cases;
+    const auto record_case = [&](const char * name, bool passed) {
+        if (!passed) {
+            ok = false;
+            failed_cases.emplace_back(name);
+        }
+    };
+    record_case("cache-hit",
+            run_scenario("cache-hit", nullptr, cuda, cpu, graph, reference, capture));
+    record_case("dispatch-fallback",
+            run_scenario("dispatch-fallback", "dispatch", cuda, cpu, graph, reference, capture));
+    record_case("collect-fallback",
+            run_scenario("collect-fallback", "collect", cuda, cpu, graph, reference, capture));
+    record_case("insert-fallback",
+            run_scenario("insert-fallback", "insert", cuda, cpu, graph, reference, capture));
+    record_case("slab-fallback",
+            run_scenario("slab-fallback", "slab", cuda, cpu, graph, reference, capture));
+    record_case("fused-cache-hit",
+            run_scenario("fused-cache-hit", nullptr, cuda, cpu,
+                    pair_graph, pair_reference, capture));
+    record_case("fused-dispatch-fallback",
+            run_scenario("fused-dispatch-fallback", "dispatch", cuda, cpu,
+                    pair_graph, pair_reference, capture));
+    record_case("fused-collect-fallback",
+            run_scenario("fused-collect-fallback", "collect", cuda, cpu,
+                    pair_graph, pair_reference, capture));
+    record_case("fused-dflash-10x16",
+            run_scenario("fused-dflash-10x16", nullptr, cuda, cpu,
+                    dflash_pair_graph, dflash_pair_reference, capture,
+                    dflash_batch, dflash_route_ids));
+    record_case("fused-prefill-bypass-2x2048",
+            run_bypass_scenario("fused-prefill-bypass-2x2048", cuda, cpu,
+                    prefill_pair_graph, prefill_pair_reference));
     const size_t expert_size = ggml_nbytes(weights) / n_expert;
-    ok &= run_precensus_invalidation(
-            cuda, cpu, graph, weights,
-            weights_q4.data() + (n_expert - 1) * expert_size,
-            expert_size, reference, capture);
+    record_case("cache-precensus-invalidate",
+            run_precensus_invalidation(
+                    cuda, cpu, graph, weights,
+                    weights_q4.data() + (n_expert - 1) * expert_size,
+                    expert_size, reference, capture));
 
     const int32_t repeated_ids[n_used] = { 0, 0 };
     ggml_backend_tensor_set(ids, repeated_ids, 0, sizeof(repeated_ids));
     set_env("GGML_CUDA_MOE_CACHE", "0");
     if (ggml_backend_graph_compute(cpu, graph.graph) != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "cache-invalidate: initial CPU reference compute failed\n");
-        ok = false;
+        fprintf(stderr, "cache-invalidate-reference-setup: CPU compute failed\n");
+        record_case("cache-invalidate-reference-setup", false);
     } else {
         std::vector<float> old_reference(ggml_nelements(graph.out));
         ggml_backend_tensor_get(
@@ -1540,31 +1690,39 @@ int main() {
                 GGML_TYPE_Q4_0, replacement_f32.data(), replacement_q4.data(),
                 0, 1, n_in, nullptr);
         if (replacement_size != replacement_q4.size()) {
-            fprintf(stderr, "cache-invalidate: unexpected replacement size\n");
-            ok = false;
+            fprintf(stderr,
+                    "cache-invalidate-reference-setup: unexpected replacement size\n");
+            record_case("cache-invalidate-reference-setup", false);
         } else {
-            ok &= run_invalidation_scenario(
-                    cuda, cpu, graph, weights, replacement_q4,
-                    old_reference, capture);
+            record_case("cache-invalidate",
+                    run_invalidation_scenario(
+                            cuda, cpu, graph, weights, replacement_q4,
+                            old_reference, capture));
         }
     }
 
     stress_fixture stress;
     if (!init_stress_fixture(stress, cpu)) {
-        fprintf(stderr, "failed to initialize cache stress fixture\n");
-        ok = false;
+        fprintf(stderr, "cache-stress-fixture-setup: initialization failed\n");
+        record_case("cache-stress-fixture-setup", false);
     } else {
-        ok &= run_concurrent_sessions(
-                cuda_device, cuda, cpu, stress, capture);
-        ok &= run_repeated_lifecycle(cuda, cpu, stress, capture);
-        ok &= run_fill_invalidation(cuda, cpu, stress, capture);
+        record_case("cache-concurrent",
+                run_concurrent_sessions(
+                        cuda_device, cuda, cpu, stress, capture));
+        record_case("cache-lifecycle",
+                run_repeated_lifecycle(cuda, cpu, stress, capture));
+        record_case("cache-fill-invalidate",
+                run_fill_invalidation(cuda, cpu, stress, capture));
     }
     free_stress_fixture(stress);
-    ok &= run_scope_isolation(cuda, cpu, weights);
-    ok &= run_shape_liveness(cuda, cpu);
-    ok &= run_route_override(cuda_device, cuda, cpu);
-    ok &= run_admission_policy(cuda, cpu, capture);
+    record_case("cache-scope", run_scope_isolation(cuda, cpu, weights));
+    record_case("cache-shape-liveness", run_shape_liveness(cuda, cpu));
+    record_case("cache-route-override",
+            run_route_override(cuda_device, cuda, cpu));
+    record_case("cache-admission-policy",
+            run_admission_policy(cuda, cpu, capture));
 
+    free_graph(prefill_pair_graph);
     free_graph(dflash_pair_graph);
     free_graph(pair_graph);
     free_graph(graph);
@@ -1592,7 +1750,7 @@ int main() {
         ggml_backend_unload(reloaded_reg);
     }
     printf("cache-backend-reload: %s\n", reload_ok ? "OK" : "FAIL");
-    ok &= reload_ok;
+    record_case("cache-backend-reload", reload_ok);
 #else
     (void) cuda_reg;
     printf("cache-backend-unload: SKIP (static backend)\n");
@@ -1604,5 +1762,13 @@ int main() {
     ggml_quantize_free();
     ggml_backend_free(cpu);
     ggml_log_set(nullptr, nullptr);
+    if (!ok) {
+        fprintf(stderr, "test-moe-cache: FAIL cases=");
+        for (size_t index = 0; index < failed_cases.size(); index++) {
+            fprintf(stderr, "%s%s", index == 0 ? "" : ",",
+                    failed_cases[index].c_str());
+        }
+        fprintf(stderr, "\n");
+    }
     return ok ? 0 : 1;
 }
