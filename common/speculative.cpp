@@ -2697,21 +2697,54 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
     {
         block_size        = llama_model_dflash_block_size(model_dft_);
         mask_token_id     = (llama_token) llama_model_dflash_mask_token_id(model_dft_);
-        n_target_layers   = llama_model_dflash_n_target_layers(model_dft_);
+        n_target_layers = llama_model_dflash_n_target_layers(model_dft_);
+        std::vector<int32_t> capture_layers;
+        if (n_target_layers > 0) {
+            capture_layers.resize(n_target_layers);
+            const int copied = llama_model_dflash_target_layer_ids(
+                    model_dft_, capture_layers.data(), n_target_layers);
+            capture_layers.resize(copied > 0 ? copied : 0);
+        } else {
+            // Architecture `dflash` stores target layers in the model vector,
+            // unlike `dflash-draft`, which uses the dedicated hparams getters.
+            // The model-vector convention is one-based. Capture compares these
+            // values with zero-based graph layer `il` (`l_out-<il>`), so normalize
+            // only this fallback path.
+            const int32_t * fallback_ids = llama_model_target_layer_ids(model_dft_);
+            const uint32_t fallback_n    = llama_model_target_layer_ids_n(model_dft_);
+            const int32_t target_n_layer = llama_model_n_layer(llama_get_model(ctx_tgt));
+            if (fallback_ids != nullptr && fallback_n > 0) {
+                capture_layers.reserve(fallback_n);
+                for (uint32_t i = 0; i < fallback_n; ++i) {
+                    if (fallback_ids[i] <= 0 || fallback_ids[i] > target_n_layer) {
+                        LOG_ERR("dflash: invalid one-based target layer id %d at index %u "
+                                "(target has %d layers)\n",
+                                fallback_ids[i], i, target_n_layer);
+                        capture_layers.clear();
+                        break;
+                    }
+                    capture_layers.push_back(fallback_ids[i] - 1);
+                }
+            }
+        }
+        n_target_layers   = (int) capture_layers.size();
         n_embd            = llama_model_n_embd(model_dft_);
         n_target_features = llama_model_dflash_n_target_features(model_dft_);
 
+        if (n_target_layers == 0) {
+            LOG_ERR("dflash: speculative boot resolved 0 target layers; "
+                    "drafting will generate 0 candidates\n");
+        }
+
         ring_buf.resize(n_target_layers);
         for (int i = 0; i < n_target_layers; ++i) {
-            ring_buf[i].resize((size_t)RING_SIZE * n_embd, 0.0f);
+            ring_buf[i].resize((size_t) RING_SIZE * n_embd, 0.0f);
         }
 
         // tok_embd/output sharing must happen BEFORE context creation
         // (done in speculative-simple.cpp before common_speculative_init)
 
         // configure target context to capture hidden states
-        std::vector<int32_t> capture_layers(n_target_layers);
-        llama_model_dflash_target_layer_ids(model_dft_, capture_layers.data(), n_target_layers);
         llama_set_dflash_capture(ctx_tgt, capture_layers.data(), n_target_layers);
 
         batch_dft = llama_batch_init(block_size, 0, 1);

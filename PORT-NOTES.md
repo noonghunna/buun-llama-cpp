@@ -202,3 +202,4 @@ left in place. Recommended owner-run validation order remains:
 | Delta | Why | Upstream status |
 |---|---|---|
 | `AGENTS.md` (new) + 3-line pointer prepended to upstream `CLAUDE.md` | fork process contract for agents (policy #10 distillation); pointer keeps single-discovery-path — CLAUDE.md remains buun's content otherwise | ours (never upstreamed; drop pointer if buun adds his own AGENTS.md) |
+| `common/speculative.cpp`: fall back from the draft-hparams target-layer getters to the architecture-`dflash` model-vector getters, normalize that one-based convention for zero-based capture, and emit an error-level warning when no layers resolve | poolside-convention DFlash models populated `target_layer_ids` but the cross-ring read only the `dflash-draft` getter family, silently binding a zero-layer ring | ours (fork issue #4; upstream candidate after original-drafter device acceptance) |
