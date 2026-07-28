@@ -4730,6 +4730,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_SPECULATIVE}).set_env("LLAMA_ARG_DFLASH_MAX_SLOTS"));
     add_opt(common_arg(
+        {"--dflash-mask-token"}, "N",
+        "override the DFlash mask token ID for draft exports without mask-token metadata",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("DFlash mask token ID must be non-negative");
+            }
+            params.speculative.dflash_mask_token = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_SPECULATIVE}).set_env("LLAMA_ARG_DFLASH_MASK_TOKEN"));
+    add_opt(common_arg(
         {"--draft-topk"}, "N",
         string_format("top-K candidates per drafter position for tree branching (default: %d)", params.speculative.draft_topk),
         [](common_params & params, int value) {

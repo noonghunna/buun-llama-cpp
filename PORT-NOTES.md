@@ -202,3 +202,4 @@ left in place. Recommended owner-run validation order remains:
 | Delta | Why | Upstream status |
 |---|---|---|
 | `AGENTS.md` (new) + 3-line pointer prepended to upstream `CLAUDE.md` | fork process contract for agents (policy #10 distillation); pointer keeps single-discovery-path — CLAUDE.md remains buun's content otherwise | ours (never upstreamed; drop pointer if buun adds his own AGENTS.md) |
+| DFlash poolside mask-token metadata aliases + explicit runtime override/warning | prevents missing metadata from silently becoming token 0 and poisoning every masked draft position; accepts both deployed key spellings and provides `--dflash-mask-token` / `LLAMA_ARG_DFLASH_MASK_TOKEN` for mask-less exports | ours (fork issue #4; merge with `dflash-loader-gate` + `fix/dflash-ring-target-ids`; device acceptance pending) |

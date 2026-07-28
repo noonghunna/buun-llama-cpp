@@ -2687,7 +2687,8 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
             llama_context * ctx_dft_,
             llama_model   * model_dft_,
             bool            owns_ctx_dft_ = true,
-            float           p_min_ = 0.0f)
+            float           p_min_ = 0.0f,
+            llama_token     mask_token_id_override = LLAMA_TOKEN_NULL)
         : common_speculative_impl(type, n_seq)
         , ctx_tgt(ctx_tgt_)
         , ctx_dft(ctx_dft_)
@@ -2696,7 +2697,13 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
         , p_min(p_min_)
     {
         block_size        = llama_model_dflash_block_size(model_dft_);
-        mask_token_id     = (llama_token) llama_model_dflash_mask_token_id(model_dft_);
+        mask_token_id     = mask_token_id_override != LLAMA_TOKEN_NULL
+            ? mask_token_id_override
+            : (llama_token) llama_model_dflash_mask_token_id(model_dft_);
+        if (mask_token_id == LLAMA_TOKEN_NULL) {
+            LOG_WRN("dflash: draft model has no mask token; masked positions will be invalid; "
+                    "export dflash.mask_token_id or pass --dflash-mask-token N\n");
+        }
         n_target_layers   = llama_model_dflash_n_target_layers(model_dft_);
         n_embd            = llama_model_n_embd(model_dft_);
         n_target_features = llama_model_dflash_n_target_features(model_dft_);
@@ -4092,7 +4099,7 @@ common_speculative * common_speculative_init(
                 GGML_ASSERT(ctx_dft != nullptr);
                 impls.push_back(std::make_unique<common_speculative_impl_dflash>(
                     config.type, n_seq, ctx_tgt, ctx_dft, params.model_dft,
-                    owns_ctx_dft, params.p_min));
+                    owns_ctx_dft, params.p_min, params.dflash_mask_token));
                 if (owns_ctx_dft) {
                     ctx_dft = nullptr;
                 }

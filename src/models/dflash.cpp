@@ -13,6 +13,14 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
     hparams.dflash_block_size = 16;
     ml.get_key(LLM_KV_DFLASH_BLOCK_SIZE, hparams.dflash_block_size, false);
 
+    // Both metadata conventions exist in the wild: the generic arch-prefixed key
+    // expands to dflash.dflash.mask_token_id for this model class, while poolside
+    // exports use dflash.mask_token_id. Keep absence distinguishable from token 0.
+    hparams.dflash_mask_token_id = uint32_t(-1);
+    if (!ml.get_key(LLM_KV_DFLASH_MASK_TOKEN_ID, hparams.dflash_mask_token_id, false)) {
+        ml.get_key(LLM_KV_DFLASH_MASK_TOKEN_ID_BARE, hparams.dflash_mask_token_id, false);
+    }
+
     if (!ml.get_arr(LLM_KV_TARGET_LAYERS, target_layer_ids, false)) {
         throw std::runtime_error("DFlash model requires 'target_layers' in GGUF metadata");
     }
