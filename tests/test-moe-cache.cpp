@@ -466,7 +466,8 @@ static void free_stress_fixture(stress_fixture & fixture) {
     fixture = {};
 }
 
-static bool init_stress_fixture(stress_fixture & fixture, ggml_backend_t cpu) {
+static bool init_stress_fixture(
+        stress_fixture & fixture, ggml_backend_t cpu, ggml_type weight_type = GGML_TYPE_Q4_0) {
     const ggml_init_params params = {
         8 * ggml_tensor_overhead(),
         nullptr,
@@ -478,7 +479,7 @@ static bool init_stress_fixture(stress_fixture & fixture, ggml_backend_t cpu) {
     }
 
     fixture.weights = ggml_new_tensor_3d(
-            fixture.ctx, GGML_TYPE_Q4_0, n_in, stress_n_out, n_expert);
+            fixture.ctx, weight_type, n_in, stress_n_out, n_expert);
     fixture.ids = ggml_new_tensor_2d(
             fixture.ctx, GGML_TYPE_I32, stress_n_used, n_tokens);
     fixture.activations = ggml_new_tensor_3d(
@@ -501,17 +502,17 @@ static bool init_stress_fixture(stress_fixture & fixture, ggml_backend_t cpu) {
             0.13f * std::sin((float) (index % 983) * 0.019f) -
             0.04f * std::cos((float) (index % 419) * 0.029f);
     }
-    std::vector<uint8_t> weights_q4(ggml_nbytes(fixture.weights));
+    std::vector<uint8_t> weights_quantized(ggml_nbytes(fixture.weights));
     const size_t quantized = ggml_quantize_chunk(
-            GGML_TYPE_Q4_0, weights_f32.data(), weights_q4.data(),
+            weight_type, weights_f32.data(), weights_quantized.data(),
             0, stress_n_out * n_expert, n_in, nullptr);
-    if (quantized != weights_q4.size()) {
+    if (quantized != weights_quantized.size()) {
         fprintf(stderr, "stress: unexpected quantized size\n");
         free_stress_fixture(fixture);
         return false;
     }
     ggml_backend_tensor_set(
-            fixture.weights, weights_q4.data(), 0, weights_q4.size());
+            fixture.weights, weights_quantized.data(), 0, weights_quantized.size());
 
     std::vector<int32_t> ids_data(stress_n_used);
     for (int32_t index = 0; index < stress_n_used; index++) {
@@ -597,6 +598,54 @@ static bool compute_matches(
         return false;
     }
     return true;
+}
+
+static bool run_q2_last_slot(
+        const char * name,
+        ggml_backend_t cuda,
+        ggml_backend_t cpu,
+        stress_fixture & fixture,
+        log_capture & capture) {
+    configure_cache(nullptr);
+    capture.clear();
+    ggml_backend_sched_t scheduler = make_scheduler(
+            name, cuda, cpu, fixture.graph);
+    if (!scheduler) {
+        return false;
+    }
+
+    bool output_ok = true;
+    bool full_pool_hit = false;
+    for (int step = 0; step < max_steps; step++) {
+        if (!compute_matches(
+                name, scheduler, fixture.graph, fixture.reference, step)) {
+            output_ok = false;
+            break;
+        }
+        const std::string log = capture.get();
+        if (max_field_value(log, "slots=") == 64 &&
+            max_field_value(log, "used=") == 64 &&
+            max_field_value(log, "hits=") >= 64) {
+            full_pool_hit = true;
+            break;
+        }
+        if (step >= 64) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    ggml_backend_sched_free(scheduler);
+
+    // With 64 experts resident in the 64-slot slab and all 64 selected in one
+    // dispatch, slot 63 is necessarily a hit. stress_n_out=65 is deliberately
+    // not divisible by the Q2 small-K rows per block, so an accidental enable
+    // or bad tail bound cannot hide behind an aligned output shape.
+    if (!full_pool_hit) {
+        fprintf(stderr, "%s: full-pool/last-slot hit was not observed\n%s",
+                name, capture.get().c_str());
+    }
+    printf("%s: %s\n", name,
+            output_ok && full_pool_hit ? "OK" : "FAIL");
+    return output_ok && full_pool_hit;
 }
 
 static bool run_precensus_invalidation(
@@ -1390,6 +1439,25 @@ int main() {
     ok &= run_scenario("insert-fallback", "insert", cuda, cpu, graph, reference, capture);
     ok &= run_scenario("slab-fallback", "slab", cuda, cpu, graph, reference, capture);
     const size_t expert_size = ggml_nbytes(weights) / n_expert;
+    const struct {
+        ggml_type type;
+        const char * name;
+    } q2_cases[] = {
+        {GGML_TYPE_Q2_0, "cache-q2_0-tail-last-slot"},
+        {GGML_TYPE_Q2_0_G128, "cache-q2_0_g128-tail-last-slot"},
+    };
+    for (const auto & q2_case : q2_cases) {
+        stress_fixture q2;
+        if (!init_stress_fixture(q2, cpu, q2_case.type)) {
+            fprintf(stderr, "%s: failed to initialize fixture\n", q2_case.name);
+            ok = false;
+        } else {
+            ok &= run_q2_last_slot(
+                    q2_case.name, cuda, cpu, q2, capture);
+        }
+        free_stress_fixture(q2);
+    }
+
     ok &= run_precensus_invalidation(
             cuda, cpu, graph, weights,
             weights_q4.data() + (n_expert - 1) * expert_size,
