@@ -43,6 +43,19 @@ void ggml_moe_cache_register(const void * owner) {
 
 #define MOE_CACHE_LOG(...) GGML_LOG_INFO(__VA_ARGS__)
 
+#ifndef GGML_CUDA_MOE_TIMING_ARM
+#define GGML_CUDA_MOE_TIMING_ARM 0
+#endif
+
+#if GGML_CUDA_MOE_TIMING_ARM < 0 || GGML_CUDA_MOE_TIMING_ARM > 2
+#error "GGML_CUDA_MOE_TIMING_ARM must be 0, 1, or 2"
+#endif
+
+#if GGML_CUDA_MOE_TIMING_ARM == 2 && \
+        !defined(__x86_64__) && !defined(_M_X64)
+#error "The sampled MoE cache timing arm requires x86-64 RDTSCP"
+#endif
+
 enum class moe_cache_slot_state : uint8_t {
     free,
     copying,
@@ -141,6 +154,102 @@ struct moe_cache_config {
 
 struct moe_cache_session;
 
+#if GGML_CUDA_MOE_TIMING_ARM > 0
+enum class moe_cache_timing_phase : uint8_t {
+    begin,
+    plan,
+    dispatch,
+    collect,
+    end,
+    fill,
+    count,
+};
+
+static constexpr size_t MOE_CACHE_TIMING_PHASES =
+    (size_t)moe_cache_timing_phase::count;
+
+struct alignas(64) moe_cache_timing_record {
+    uint64_t calls[MOE_CACHE_TIMING_PHASES] = {};
+    uint64_t samples[MOE_CACHE_TIMING_PHASES] = {};
+    uint64_t cycles[MOE_CACHE_TIMING_PHASES] = {};
+    uint64_t migrations[MOE_CACHE_TIMING_PHASES] = {};
+    uint32_t ordinal = 0;
+    bool fill_worker = false;
+};
+
+// Volatile by design: arm 1 retains the guard/object/branch scaffold while
+// making the timing path unreachable at runtime.
+static volatile bool g_moe_cache_timing_enabled =
+    GGML_CUDA_MOE_TIMING_ARM == 2;
+
+#if GGML_CUDA_MOE_TIMING_ARM == 2
+static inline uint64_t moe_cache_rdtscp(uint32_t & aux) {
+    uint32_t lo = 0;
+    uint32_t hi = 0;
+    asm volatile(
+            "lfence\n\t"
+            "rdtscp\n\t"
+            "lfence\n\t"
+            : "=a"(lo), "=d"(hi), "=c"(aux)
+            :
+            : "memory");
+    return ((uint64_t)hi << 32) | lo;
+}
+#endif
+
+class moe_cache_timing_guard {
+public:
+    moe_cache_timing_guard(
+            moe_cache_timing_record * record, moe_cache_timing_phase phase)
+        : record_(record), phase_((size_t)phase) {
+        if (!g_moe_cache_timing_enabled || !record_) {
+            return;
+        }
+#if GGML_CUDA_MOE_TIMING_ARM == 2
+        const uint64_t call = ++record_->calls[phase_];
+        if ((call & 1023u) != 0) {
+            return;
+        }
+        start_ = moe_cache_rdtscp(start_aux_);
+        sampled_ = true;
+#endif
+    }
+
+    ~moe_cache_timing_guard() {
+#if GGML_CUDA_MOE_TIMING_ARM == 2
+        if (!sampled_) {
+            return;
+        }
+        uint32_t end_aux = 0;
+        const uint64_t end = moe_cache_rdtscp(end_aux);
+        if (end_aux != start_aux_) {
+            record_->migrations[phase_]++;
+            return;
+        }
+        record_->cycles[phase_] += end - start_;
+        record_->samples[phase_]++;
+#endif
+    }
+
+private:
+    moe_cache_timing_record * record_ = nullptr;
+    size_t phase_ = 0;
+#if GGML_CUDA_MOE_TIMING_ARM == 2
+    uint64_t start_ = 0;
+    uint32_t start_aux_ = 0;
+    bool sampled_ = false;
+#endif
+};
+
+#define MOE_CACHE_TIMING_JOIN_INNER(a, b) a##b
+#define MOE_CACHE_TIMING_JOIN(a, b) MOE_CACHE_TIMING_JOIN_INNER(a, b)
+#define MOE_CACHE_TIME(record, phase) \
+    moe_cache_timing_guard MOE_CACHE_TIMING_JOIN(moe_cache_timing_guard_, __LINE__)( \
+            (record), moe_cache_timing_phase::phase)
+#else
+#define MOE_CACHE_TIME(record, phase) do { } while (0)
+#endif
+
 struct moe_cache_scratch {
     size_t ids = 0;
     size_t act = 0;
@@ -210,6 +319,13 @@ struct moe_cache_session {
     std::vector<std::unique_ptr<moe_cache_device>> devices;
     std::unordered_map<int, int> layer_devices;
     std::unordered_map<const void *, int> tensor_devices;
+#if GGML_CUDA_MOE_TIMING_ARM > 0
+    uint64_t timing_id = 0;
+    uint32_t next_decode_timing = 0;
+    uint32_t next_fill_timing = 0;
+    std::vector<std::unique_ptr<moe_cache_timing_record>> timing_records;
+#endif
+
 
     std::mutex mu;
     std::mutex fill_mu;
@@ -243,6 +359,9 @@ struct moe_cache_node {
     int64_t n_expert = 0;
     int wtype = -1;
     std::unique_lock<std::mutex> dispatch_lock;
+#if GGML_CUDA_MOE_TIMING_ARM > 0
+    moe_cache_timing_record * timing = nullptr;
+#endif
     moe_cache_pin pins[64];
     int n_pins = 0;
     bool planned = false;
@@ -255,6 +374,9 @@ static std::atomic<int> g_session_count{0};
 struct moe_cache_scope_frame {
     moe_cache_session * requested = nullptr;
     moe_cache_session * active = nullptr;
+#if GGML_CUDA_MOE_TIMING_ARM > 0
+    moe_cache_timing_record * timing = nullptr;
+#endif
 };
 static thread_local std::vector<moe_cache_scope_frame> g_session_stack;
 static thread_local int g_session_suppressed = 0;
@@ -262,6 +384,64 @@ static thread_local int g_session_suppressed = 0;
 static size_t moe_cache_trim_session(
         moe_cache_session & session, int physical_device);
 
+#if GGML_CUDA_MOE_TIMING_ARM == 2
+struct moe_cache_timing_tls_entry {
+    moe_cache_session * session = nullptr;
+    uint64_t timing_id = 0;
+    moe_cache_timing_record * record = nullptr;
+};
+
+static std::atomic<uint64_t> g_moe_cache_timing_ids{1};
+static thread_local moe_cache_timing_tls_entry g_moe_cache_timing_tls;
+
+// Caller holds session.mu. The returned shard is touched by this thread only;
+// session ownership keeps it alive until teardown aggregation.
+static moe_cache_timing_record * moe_cache_timing_record_locked(
+        moe_cache_session & session, bool fill_worker) {
+    if (g_moe_cache_timing_tls.session == &session &&
+        g_moe_cache_timing_tls.timing_id == session.timing_id &&
+        g_moe_cache_timing_tls.record &&
+        g_moe_cache_timing_tls.record->fill_worker == fill_worker) {
+        return g_moe_cache_timing_tls.record;
+    }
+
+    std::unique_ptr<moe_cache_timing_record> record(
+            new (std::nothrow) moe_cache_timing_record());
+    if (!record) {
+        return nullptr;
+    }
+    record->fill_worker = fill_worker;
+    record->ordinal = fill_worker
+        ? session.next_fill_timing++ : session.next_decode_timing++;
+    moe_cache_timing_record * result = record.get();
+    try {
+        session.timing_records.emplace_back(std::move(record));
+    } catch (...) {
+        return nullptr;
+    }
+    g_moe_cache_timing_tls = {&session, session.timing_id, result};
+    return result;
+}
+
+static moe_cache_timing_record * moe_cache_timing_record_for_worker(
+        moe_cache_session & session) {
+    std::lock_guard<std::mutex> lock(session.mu);
+    return moe_cache_timing_record_locked(session, true);
+}
+#endif
+
+#if GGML_CUDA_MOE_TIMING_ARM > 0
+#define MOE_CACHE_TIMING_FRAME_RECORD(frame) ((frame).timing)
+#define MOE_CACHE_TIMING_NODE_RECORD(node) ((node) ? (node)->timing : nullptr)
+#else
+#define MOE_CACHE_TIMING_FRAME_RECORD(frame) nullptr
+#define MOE_CACHE_TIMING_NODE_RECORD(node) nullptr
+#endif
+#if GGML_CUDA_MOE_TIMING_ARM == 2
+#define MOE_CACHE_TIMING_WORKER_RECORD(session) moe_cache_timing_record_for_worker(session)
+#else
+#define MOE_CACHE_TIMING_WORKER_RECORD(session) nullptr
+#endif
 static bool moe_cache_env_i64(
         const char * name, int64_t min_value, int64_t max_value, int64_t & value) {
     const char * text = getenv(name);
@@ -630,6 +810,9 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
     char * stage = nullptr;
     size_t stage_capacity = 0;
     cudaStream_t stream = nullptr;
+#if GGML_CUDA_MOE_TIMING_ARM > 0
+    auto worker_timing = MOE_CACHE_TIMING_WORKER_RECORD(*session);
+#endif
 
     for (;;) {
         moe_cache_job job;
@@ -652,6 +835,7 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
             device->inflight_source = job.source;
             device->inflight_bytes = job.bytes;
         }
+        MOE_CACHE_TIME(worker_timing, fill);
 
         cudaError_t error = cudaSuccess;
         ggml_cuda_set_device(device->physical);
@@ -1041,6 +1225,58 @@ static void moe_cache_log_stats(moe_cache_device & device) {
             device.dispatch_failures, device.collect_failures);
 }
 
+#if GGML_CUDA_MOE_TIMING_ARM == 2
+static void moe_cache_log_timing(const moe_cache_session & session) {
+    static const char * const phase_names[MOE_CACHE_TIMING_PHASES] = {
+        "begin", "plan", "dispatch", "collect", "end", "fill",
+    };
+    uint64_t total_calls[MOE_CACHE_TIMING_PHASES] = {};
+    uint64_t total_samples[MOE_CACHE_TIMING_PHASES] = {};
+    uint64_t total_cycles[MOE_CACHE_TIMING_PHASES] = {};
+    uint64_t total_migrations[MOE_CACHE_TIMING_PHASES] = {};
+
+    for (const auto & owned : session.timing_records) {
+        const moe_cache_timing_record & record = *owned;
+        for (size_t phase = 0; phase < MOE_CACHE_TIMING_PHASES; phase++) {
+            total_calls[phase] += record.calls[phase];
+            total_samples[phase] += record.samples[phase];
+            total_cycles[phase] += record.cycles[phase];
+            total_migrations[phase] += record.migrations[phase];
+            if (record.calls[phase] == 0) {
+                continue;
+            }
+            const uint64_t average = record.samples[phase]
+                ? record.cycles[phase] / record.samples[phase] : 0;
+            MOE_CACHE_LOG(
+                    "[moe-cache-timing] role=%s index=%u phase=%s calls=%llu samples=%llu cycles=%llu cycles/sample=%llu migrations=%llu\n",
+                    record.fill_worker ? "fill" : "decode", record.ordinal,
+                    phase_names[phase],
+                    (unsigned long long)record.calls[phase],
+                    (unsigned long long)record.samples[phase],
+                    (unsigned long long)record.cycles[phase],
+                    (unsigned long long)average,
+                    (unsigned long long)record.migrations[phase]);
+        }
+    }
+
+    for (size_t phase = 0; phase < MOE_CACHE_TIMING_PHASES; phase++) {
+        if (total_calls[phase] == 0) {
+            continue;
+        }
+        const uint64_t average = total_samples[phase]
+            ? total_cycles[phase] / total_samples[phase] : 0;
+        MOE_CACHE_LOG(
+                "[moe-cache-timing] role=all phase=%s calls=%llu samples=%llu cycles=%llu cycles/sample=%llu migrations=%llu\n",
+                phase_names[phase],
+                (unsigned long long)total_calls[phase],
+                (unsigned long long)total_samples[phase],
+                (unsigned long long)total_cycles[phase],
+                (unsigned long long)average,
+                (unsigned long long)total_migrations[phase]);
+    }
+}
+#endif
+
 static void * moe_cache_session_create(void * const * backends, int n_backends) {
     try {
         moe_cache_config config = moe_cache_read_config();
@@ -1053,6 +1289,9 @@ static void * moe_cache_session_create(void * const * backends, int n_backends) 
             return nullptr;
         }
         session->config = std::move(config);
+#if GGML_CUDA_MOE_TIMING_ARM == 2
+        session->timing_id = g_moe_cache_timing_ids.fetch_add(1, std::memory_order_relaxed);
+#endif
 
         std::unordered_set<int> seen_devices;
         for (int index = 0; index < n_backends &&
@@ -1207,6 +1446,9 @@ static void moe_cache_session_destroy(void * opaque) {
             device_ptr->worker.join();
         }
     }
+#if GGML_CUDA_MOE_TIMING_ARM == 2
+    moe_cache_log_timing(*session);
+#endif
     {
         std::lock_guard<std::mutex> registry_lock(g_registry_mu);
         if (g_sessions.erase(session) > 0) {
@@ -1271,7 +1513,11 @@ static void moe_cache_session_enter(void * opaque) {
         return;
     }
     try {
-        g_session_stack.push_back({session, session});
+        moe_cache_scope_frame frame{session, session};
+#if GGML_CUDA_MOE_TIMING_ARM == 2
+        frame.timing = moe_cache_timing_record_locked(*session, false);
+#endif
+        g_session_stack.push_back(frame);
     } catch (...) {
         g_session_suppressed++;
         return;
@@ -1311,6 +1557,7 @@ static void * moe_cache_begin(
         return nullptr;
     }
     moe_cache_session * session = g_session_stack.back().active;
+    MOE_CACHE_TIME(MOE_CACHE_TIMING_FRAME_RECORD(g_session_stack.back()), begin);
     if (!session || session->stopping || session->dormant || !name || !host_base ||
         !strstr(name, "_exps") || n_tokens < 1 ||
         n_tokens > session->config.max_batch ||
@@ -1565,6 +1812,9 @@ static void * moe_cache_begin(
     node->n_out = n_out;
     node->n_expert = n_expert;
     node->wtype = wtype;
+#if GGML_CUDA_MOE_TIMING_ARM > 0
+    node->timing = MOE_CACHE_TIMING_FRAME_RECORD(g_session_stack.back());
+#endif
     node->dispatch_lock = std::move(dispatch_lock);
     return node.release();
 }
@@ -1572,6 +1822,7 @@ static void * moe_cache_begin(
 static int moe_cache_plan(
         void * opaque, const int32_t * ids, int n_ids, int32_t * slot_indices) {
     moe_cache_node * node = (moe_cache_node *)opaque;
+    MOE_CACHE_TIME(MOE_CACHE_TIMING_NODE_RECORD(node), plan);
     if (!node || !ids || !slot_indices || n_ids < 0 || n_ids > 64 || node->planned) {
         return 0;
     }
@@ -1699,6 +1950,7 @@ static int moe_cache_dispatch(
         void * opaque, int wtype, int64_t n_in, int64_t n_out, int n_hits,
         const int32_t * slot_indices, const float * const * act_rows) {
     moe_cache_node * node = (moe_cache_node *)opaque;
+    MOE_CACHE_TIME(MOE_CACHE_TIMING_NODE_RECORD(node), dispatch);
     if (!node || !node->planned || node->dispatched || n_hits <= 0 ||
         n_hits > 64 || n_hits != node->n_pins || !slot_indices || !act_rows ||
         wtype != node->wtype || n_in != node->n_in || n_out != node->n_out ||
@@ -1863,6 +2115,7 @@ static int moe_cache_dispatch(
 static int moe_cache_collect(
         void * opaque, int n_hits, float * const * dst_rows, int64_t n_out) {
     moe_cache_node * node = (moe_cache_node *)opaque;
+    MOE_CACHE_TIME(MOE_CACHE_TIMING_NODE_RECORD(node), collect);
     if (!node || !node->dispatched || n_hits <= 0 || n_hits > 64 ||
         n_hits != node->n_pins || !dst_rows || n_out != node->n_out) {
         return 0;
@@ -1918,7 +2171,9 @@ static int moe_cache_collect(
 }
 
 static void moe_cache_end(void * opaque) {
-    std::unique_ptr<moe_cache_node> node((moe_cache_node *)opaque);
+    moe_cache_node * raw_node = (moe_cache_node *)opaque;
+    MOE_CACHE_TIME(MOE_CACHE_TIMING_NODE_RECORD(raw_node), end);
+    std::unique_ptr<moe_cache_node> node(raw_node);
     if (!node) {
         return;
     }

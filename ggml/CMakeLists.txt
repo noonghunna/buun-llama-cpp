@@ -197,6 +197,9 @@ set(GGML_BLAS_VENDOR ${GGML_BLAS_VENDOR_DEFAULT} CACHE STRING
 option(GGML_LLAMAFILE                       "ggml: use LLAMAFILE"                             ${GGML_LLAMAFILE_DEFAULT})
 
 option(GGML_CUDA                            "ggml: use CUDA"                                  OFF)
+set   (GGML_CUDA_MOE_TIMING_ARM "0" CACHE STRING
+                                            "ggml: MoE cache timing arm (0=uninstrumented, 1=guards disabled, 2=RDTSCP sample/1024)")
+set_property(CACHE GGML_CUDA_MOE_TIMING_ARM PROPERTY STRINGS "0;1;2")
 option(GGML_MUSA                            "ggml: use MUSA"                                  OFF)
 option(GGML_CUDA_FORCE_MMQ                  "ggml: use mmq kernels instead of cuBLAS"         OFF)
 option(GGML_CUDA_FORCE_CUBLAS               "ggml: always use cuBLAS instead of mmq kernels"  OFF)

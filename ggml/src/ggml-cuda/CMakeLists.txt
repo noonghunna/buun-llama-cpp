@@ -104,6 +104,54 @@ if (CUDAToolkit_FOUND)
 
     file(GLOB   GGML_SOURCES_CUDA "*.cu")
     list(FILTER GGML_SOURCES_CUDA EXCLUDE REGEX "bsa_.*\\.cu$")
+    if (NOT GGML_CUDA_MOE_TIMING_ARM MATCHES "^[012]$")
+        message(FATAL_ERROR "GGML_CUDA_MOE_TIMING_ARM must be 0, 1, or 2")
+    endif()
+    set_property(
+        SOURCE moe-cache.cu
+        APPEND PROPERTY COMPILE_DEFINITIONS
+        GGML_CUDA_MOE_TIMING_ARM=${GGML_CUDA_MOE_TIMING_ARM})
+
+    execute_process(
+        COMMAND git -C "${CMAKE_SOURCE_DIR}" rev-parse HEAD
+        OUTPUT_VARIABLE MOE_TIMING_SOURCE_COMMIT
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET)
+    execute_process(
+        COMMAND git -C "${CMAKE_SOURCE_DIR}" status --porcelain
+        OUTPUT_VARIABLE MOE_TIMING_SOURCE_STATUS
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET)
+    if (MOE_TIMING_SOURCE_STATUS STREQUAL "")
+        set(MOE_TIMING_SOURCE_DIRTY no)
+    else()
+        set(MOE_TIMING_SOURCE_DIRTY yes)
+    endif()
+    file(WRITE "${CMAKE_BINARY_DIR}/moe-timing-build-manifest.txt"
+        "source_commit=${MOE_TIMING_SOURCE_COMMIT}\n"
+        "source_dirty=${MOE_TIMING_SOURCE_DIRTY}\n"
+        "timing_arm=${GGML_CUDA_MOE_TIMING_ARM}\n"
+        "generator=${CMAKE_GENERATOR}\n"
+        "build_type=${CMAKE_BUILD_TYPE}\n"
+        "c_compiler=${CMAKE_C_COMPILER}|${CMAKE_C_COMPILER_ID}|${CMAKE_C_COMPILER_VERSION}\n"
+        "cxx_compiler=${CMAKE_CXX_COMPILER}|${CMAKE_CXX_COMPILER_ID}|${CMAKE_CXX_COMPILER_VERSION}\n"
+        "cuda_compiler=${CMAKE_CUDA_COMPILER}|${CMAKE_CUDA_COMPILER_ID}|${CMAKE_CUDA_COMPILER_VERSION}\n"
+        "cuda_host_compiler=${CMAKE_CUDA_HOST_COMPILER}\n"
+        "cuda_architectures=${CMAKE_CUDA_ARCHITECTURES}\n"
+        "c_flags=${CMAKE_C_FLAGS}|${CMAKE_C_FLAGS_RELEASE}\n"
+        "cxx_flags=${CMAKE_CXX_FLAGS}|${CMAKE_CXX_FLAGS_RELEASE}\n"
+        "cuda_flags=${CMAKE_CUDA_FLAGS}|${CMAKE_CUDA_FLAGS_RELEASE}\n"
+        "exe_linker_flags=${CMAKE_EXE_LINKER_FLAGS}|${CMAKE_EXE_LINKER_FLAGS_RELEASE}\n"
+        "shared_linker_flags=${CMAKE_SHARED_LINKER_FLAGS}|${CMAKE_SHARED_LINKER_FLAGS_RELEASE}\n"
+        "build_shared_libs=${BUILD_SHARED_LIBS}\n"
+        "ggml_cuda_fa=${GGML_CUDA_FA}\n"
+        "ggml_cuda_fa_all_quants=${GGML_CUDA_FA_ALL_QUANTS}\n"
+        "ggml_cuda_force_mmq=${GGML_CUDA_FORCE_MMQ}\n"
+        "ggml_cuda_force_cublas=${GGML_CUDA_FORCE_CUBLAS}\n"
+        "ggml_cuda_graphs=${GGML_CUDA_GRAPHS}\n"
+        "ggml_cuda_no_peer_copy=${GGML_CUDA_NO_PEER_COPY}\n"
+        "ggml_cuda_no_vmm=${GGML_CUDA_NO_VMM}\n")
+
     file(GLOB   SRCS "template-instances/fattn-tile*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/fattn-mma*.cu")
