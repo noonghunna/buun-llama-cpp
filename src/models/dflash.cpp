@@ -37,7 +37,7 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
     type = LLM_TYPE_UNKNOWN;
 }
 
-void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
+void llama_model_dflash::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
 
     const int64_t n_embd_inp = hparams.n_embd_inp_enc();
@@ -45,6 +45,8 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
     fc              = create_tensor(tn(LLM_TENSOR_FC,              "weight"), { n_embd_inp, n_embd }, 0);
     output_norm_enc = create_tensor(tn(LLM_TENSOR_ENC_OUTPUT_NORM, "weight"), { n_embd }, 0); // encoder hidden_norm (after fc)
     output_norm     = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM,    "weight"), { n_embd }, 0); // decoder final norm
+    aux_norm        = create_tensor(tn(LLM_TENSOR_ENC_AUX_NORM,   "weight"),
+            { n_embd, (int64_t) target_layer_ids.size() }, TENSOR_NOT_REQUIRED);
 
     for (int i = 0; i < n_layer; ++i) {
         auto & layer = layers[i];
@@ -58,6 +60,21 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
 
         layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), { n_embd_head_k }, 0);
         layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), { n_embd_head_k }, 0);
+
+        const ggml_tensor * gate_meta = ml.get_tensor_meta(
+                tn(LLM_TENSOR_ATTN_GATE, "weight", i).str().c_str());
+        if (gate_meta != nullptr) {
+            const int64_t n_gate_out = gate_meta->ne[1];
+            if (n_gate_out != n_head && n_gate_out != n_embd_head_k * n_head) {
+                GGML_ABORT("DFlash: unexpected attention gate width %lld at layer %d "
+                           "(expected %lld per-head or %lld per-element)",
+                           (long long) n_gate_out, i, (long long) n_head,
+                           (long long) (n_embd_head_k * n_head));
+            }
+            layer.wqkv_gate = create_tensor(
+                    tn(LLM_TENSOR_ATTN_GATE, "weight", i),
+                    { n_embd, n_gate_out }, TENSOR_NOT_REQUIRED);
+        }
 
         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), { n_embd }, 0);
         layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), { n_embd, n_ff }, 0);
@@ -96,7 +113,20 @@ ggml_tensor * llama_model_dflash::graph<true>::build_inp_embd_enc() const {
 // DFlash Encoder: processes target model features through feature fusion layer
 template <>
 llama_model_dflash::graph<true>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
+    const auto & model_df = static_cast<const llama_model_dflash &>(model);
+
     ggml_tensor * cur = build_inp_embd_enc();
+
+    if (model_df.aux_norm != nullptr) {
+        const int64_t n_aux  = model_df.aux_norm->ne[1];
+        const int64_t n_feat = hparams.n_embd_inp_enc() / n_aux;
+
+        cur = ggml_reshape_3d(ctx0, cur, n_feat, n_aux, n_tokens);
+        cur = ggml_rms_norm(ctx0, cur, hparams.f_norm_rms_eps);
+        cur = ggml_mul(ctx0, cur, model_df.aux_norm);
+        cur = ggml_reshape_2d(ctx0, cur, n_feat * n_aux, n_tokens);
+        cb(cur, "enc_aux_norm", -1);
+    }
 
     cur = build_lora_mm(model.fc, cur);
     cb(cur, "fc_out", -1);
@@ -251,10 +281,32 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         cb(Kcur, "Kcur", il);
         cb(Vcur, "Vcur", il);
 
-        // cache-aware, non-causal attention
+        // Cache-aware, non-causal attention. When an optional gate is
+        // present, defer o_proj until after the Laguna-style output gate.
+        const bool    gated = layer.wqkv_gate != nullptr;
+        ggml_tensor * wo    = gated ? NULL : layer.wo;
         ggml_tensor * cur = use_iswa
-            ? build_attn(inp_attn_iswa, layer.wo, NULL, NULL, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il)
-            : build_attn(inp_attn,      layer.wo, NULL, NULL, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+            ? build_attn(inp_attn_iswa, wo, NULL, NULL, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il)
+            : build_attn(inp_attn,      wo, NULL, NULL, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+
+        if (gated) {
+            ggml_tensor * gate = build_lora_mm(layer.wqkv_gate, noise_norm);
+            gate = ggml_softplus(ctx0, gate);
+            cb(gate, "attn_gate_softplus", il);
+
+            const int64_t n_tok = cur->ne[1];
+            if (layer.wqkv_gate->ne[1] == n_head) {
+                cur  = ggml_reshape_3d(ctx0, cur,  n_embd_head, n_head, n_tok);
+                gate = ggml_reshape_3d(ctx0, gate, 1,           n_head, n_tok);
+                cur  = ggml_mul(ctx0, cur, gate);
+                cur  = ggml_reshape_2d(ctx0, cur, n_embd_head * n_head, n_tok);
+            } else {
+                cur = ggml_mul(ctx0, cur, gate);
+            }
+            cb(cur, "attn_gated", il);
+
+            cur = build_lora_mm(layer.wo, cur);
+        }
 
         ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpL);
         cb(ffn_inp, "ffn_inp", il);

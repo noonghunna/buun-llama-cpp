@@ -1296,6 +1296,8 @@ struct llama_model_dflash : public llama_model_base {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
+    ggml_tensor * aux_norm = nullptr;
+
     template <bool is_enc>
     struct graph : public llm_graph_context {
         graph(const llama_model & model, const llm_graph_params & params);
