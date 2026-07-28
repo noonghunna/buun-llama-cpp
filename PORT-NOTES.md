@@ -202,3 +202,4 @@ left in place. Recommended owner-run validation order remains:
 | Delta | Why | Upstream status |
 |---|---|---|
 | `AGENTS.md` (new) + 3-line pointer prepended to upstream `CLAUDE.md` | fork process contract for agents (policy #10 distillation); pointer keeps single-discovery-path — CLAUDE.md remains buun's content otherwise | ours (never upstreamed; drop pointer if buun adds his own AGENTS.md) |
+| `moe-cache.cu` demand-age telemetry + focused `test-moe-cache` assertions | issue #5 fresh-to-6h soak needs cumulative demand-map size, a histogram relative to the admit/readmit thresholds (`below/warm/ready`), and fills per 1,000 cache nodes in the existing stats line; policy behavior is unchanged | ours (fork issue #5; upstream candidate if the soak confirms the predicted aging signature) |

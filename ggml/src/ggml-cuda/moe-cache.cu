@@ -1023,7 +1023,8 @@ static int moe_cache_discover_pool(
     return moe_cache_find_pool(device, expert_size, wtype);
 }
 
-static void moe_cache_log_stats(moe_cache_device & device) {
+static void moe_cache_log_stats(
+        const moe_cache_config & config, moe_cache_device & device) {
     size_t used = 0;
     size_t slots = 0;
     for (const auto & pool_ptr : device.pools) {
@@ -1031,14 +1032,33 @@ static void moe_cache_log_stats(moe_cache_device & device) {
         slots += pool.n_slots;
         used += pool.n_slots - pool.free_slots.size();
     }
+    const int admit_after = config.admit_after;
+    const int readmit_after = std::max(admit_after, config.readmit_after);
+    size_t demand_below = 0;
+    size_t demand_warm = 0;
+    size_t demand_ready = 0;
+    for (const auto & entry : device.demand_count) {
+        if (entry.second.count < admit_after) {
+            demand_below++;
+        } else if (entry.second.count < readmit_after) {
+            demand_warm++;
+        } else {
+            demand_ready++;
+        }
+    }
     const long long total = device.hits + device.misses;
-    MOE_CACHE_LOG("[moe-cache] CUDA%d hits=%lld/%lld (%.1f%%) used=%zu/%zu enqueued=%lld filled=%lld fill-fail=%lld evictions=%lld skips=%lld admission=%lld queue=%zu jobs/%zu MiB dispatch-fail=%lld collect-fail=%lld\n",
+    const double fills_per_k_nodes = device.nodes > 0
+        ? 1000.0 * (double)device.fills / (double)device.nodes : 0.0;
+    // demand-hist is count < admit / admit <= count < readmit / count >= readmit.
+    MOE_CACHE_LOG("[moe-cache] CUDA%d hits=%lld/%lld (%.1f%%) used=%zu/%zu enqueued=%lld filled=%lld fill-fail=%lld evictions=%lld skips=%lld admission=%lld queue=%zu jobs/%zu MiB dispatch-fail=%lld collect-fail=%lld demand-map=%zu demand-hist=%zu/%zu/%zu@%d/%d fills/1k-nodes=%.1f\n",
             device.physical, device.hits, total,
             total ? 100.0 * (double)device.hits / (double)total : 0.0,
             used, slots, device.inserts, device.fills, device.fill_failures,
             device.evictions, device.insert_skips,
             device.admission_skips, device.queue.size(), device.queued_bytes >> 20,
-            device.dispatch_failures, device.collect_failures);
+            device.dispatch_failures, device.collect_failures,
+            device.demand_count.size(), demand_below, demand_warm, demand_ready,
+            admit_after, readmit_after, fills_per_k_nodes);
 }
 
 static void * moe_cache_session_create(void * const * backends, int n_backends) {
@@ -1217,7 +1237,7 @@ static void moe_cache_session_destroy(void * opaque) {
     for (auto & device_ptr : session->devices) {
         if (device_ptr->nodes > 0 || device_ptr->dispatch_failures > 0 ||
             device_ptr->collect_failures > 0) {
-            moe_cache_log_stats(*device_ptr);
+            moe_cache_log_stats(session->config, *device_ptr);
         }
     }
 
@@ -1911,7 +1931,7 @@ static int moe_cache_collect(
         device.collect_calls++;
         if (session.config.stats_every > 0 &&
             device.collect_calls % session.config.stats_every == 0) {
-            moe_cache_log_stats(device);
+            moe_cache_log_stats(session.config, device);
         }
     }
     return ok ? 1 : 0;

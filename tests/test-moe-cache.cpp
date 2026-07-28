@@ -1245,10 +1245,16 @@ static bool run_admission_policy_once(
         new_expert_misses == 8 ? 65 : 64;
     const long long expected_evictions =
         new_expert_misses == 8 ? 1 : 0;
+    const std::string expected_demand =
+        new_expert_misses == 8
+            ? "demand-map=0 demand-hist=0/0/0@2/8"
+            : "demand-map=1 demand-hist=0/1/0@2/8";
     return ok &&
         max_field_value(log, "slots=") == 64 &&
         max_field_value(log, "enqueued=") == expected_enqueued &&
-        max_field_value(log, "evictions=") == expected_evictions;
+        max_field_value(log, "evictions=") == expected_evictions &&
+        log.find(expected_demand) != std::string::npos &&
+        log.find("fills/1k-nodes=") != std::string::npos;
 }
 
 static bool run_admission_policy(
