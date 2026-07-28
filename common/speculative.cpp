@@ -1049,6 +1049,58 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         llama_batch_free(batch_inject);
     }
 
+    bool prepare_draft_append(
+            llama_seq_id seq_id,
+            llama_pos    actual_start,
+            int32_t      injection_offset,
+            int32_t      n_tokens,
+            const char * stage) {
+        auto * mem_dft = llama_get_memory(params.ctx_dft);
+
+        const llama_pos pos_min_before = llama_memory_seq_pos_min(mem_dft, seq_id);
+        const llama_pos pos_max_before = llama_memory_seq_pos_max(mem_dft, seq_id);
+
+        // Both target-feature reinjection and steady-state re-drafting can
+        // replace a suffix already present in the drafter KV. Newer memory
+        // allocators require the next batch to begin exactly at pos_max + 1,
+        // so discard the replaced suffix before either decoder call.
+        if (pos_max_before >= actual_start) {
+            if (!llama_memory_seq_rm(mem_dft, seq_id, actual_start, -1)) {
+                LOG_ERR("%s: DFlash %s rewind failed for seq_id=%d at pos=%d "
+                        "(kv_pos_min=%d, kv_pos_max=%d, injection_offset=%d, n_tokens=%d)\n",
+                        __func__, stage, (int) seq_id, (int) actual_start,
+                        (int) pos_min_before, (int) pos_max_before,
+                        (int) injection_offset, (int) n_tokens);
+                return false;
+            }
+        }
+
+        const llama_pos pos_min_after = llama_memory_seq_pos_min(mem_dft, seq_id);
+        const llama_pos pos_max_after = llama_memory_seq_pos_max(mem_dft, seq_id);
+        const llama_pos expected_start = pos_max_after >= 0 ? pos_max_after + 1 : actual_start;
+
+        LOG_TRC("%s: DFlash %s step seq_id=%d kv_before=[%d,%d] kv_after=[%d,%d] "
+                "expected_start=%d actual_start=%d injection_offset=%d n_tokens=%d\n",
+                __func__, stage, (int) seq_id,
+                (int) pos_min_before, (int) pos_max_before,
+                (int) pos_min_after, (int) pos_max_after,
+                (int) expected_start, (int) actual_start,
+                (int) injection_offset, (int) n_tokens);
+
+        if (actual_start != expected_start) {
+            LOG_ERR("%s: DFlash %s position mismatch for seq_id=%d: "
+                    "expected_start=%d, actual_start=%d, kv_pos_min=%d, kv_pos_max=%d, "
+                    "injection_offset=%d, n_tokens=%d\n",
+                    __func__, stage, (int) seq_id,
+                    (int) expected_start, (int) actual_start,
+                    (int) pos_min_after, (int) pos_max_after,
+                    (int) injection_offset, (int) n_tokens);
+            return false;
+        }
+
+        return true;
+    }
+
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
@@ -1096,25 +1148,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
 
-        // draft() advances the drafter KV through the speculative suffix. The
-        // next target batch starts at that suffix's first position, where the
-        // target-conditioned encoder output must replace the speculative KV.
-        // Without this rewind the batch allocator sees, for example, stored
-        // position 61 followed by an injection beginning at 56 and rejects the
-        // otherwise valid batch as non-consecutive.
-        auto * mem_dft = llama_get_memory(ctx_dft);
-        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-            if (i_batch_beg[seq_id] < 0) {
-                continue;
-            }
-            const llama_pos p0 = batch_in.pos[i_batch_beg[seq_id]];
-            if (!llama_memory_seq_rm(mem_dft, seq_id, p0, -1)) {
-                LOG_ERR("%s: failed to discard stale draft KV for seq_id=%d at pos=%d\n",
-                        __func__, (int) seq_id, (int) p0);
-                return false;
-            }
-        }
-
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -1125,6 +1158,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
+
+                const llama_pos injection_start = batch_in.pos[i_batch_beg[seq_id] + offset];
+                if (!prepare_draft_append(seq_id, injection_start, offset, n_chunk, "reinjection")) {
+                    return false;
+                }
 
                 // gather this chunk's target features, interleaved by extract layer
                 features_buf.resize((size_t) n_chunk * n_embd_enc);
@@ -1175,8 +1213,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 }
                 rc = llama_decode(ctx_dft, batch_inject);
                 if (rc != 0) {
-                    LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
-                            __func__, rc, (int) n_chunk, (int) offset);
+                    auto * mem_dft = llama_get_memory(ctx_dft);
+                    const llama_pos pos_min = llama_memory_seq_pos_min(mem_dft, seq_id);
+                    const llama_pos pos_max = llama_memory_seq_pos_max(mem_dft, seq_id);
+                    const llama_pos expected_start = pos_max >= 0 ? pos_max + 1 : injection_start;
+                    LOG_ERR("%s: DFlash reinjection decode rejected rc=%d for seq_id=%d: "
+                            "expected_start=%d, actual_start=%d, kv_pos_min=%d, kv_pos_max=%d, "
+                            "injection_offset=%d, n_tokens=%d\n",
+                            __func__, rc, (int) seq_id, (int) expected_start, (int) injection_start,
+                            (int) pos_min, (int) pos_max, (int) offset, (int) n_chunk);
                     return false;
                 }
             }
@@ -1211,6 +1256,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
 
             const int32_t n_block_tokens = n_draft + 1; // id_last + n_draft * <mask>
+            if (!prepare_draft_append(seq_id, n, 0, n_block_tokens, "draft")) {
+                continue;
+            }
+
             i_block_beg[seq_id] = batch.n_tokens;
             n_block    [seq_id] = n_block_tokens;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
@@ -1225,7 +1274,21 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // decode all sequence's noise block in a single batch
         int ret = llama_decode(ctx_dft, batch);
         if (ret != 0) {
-            LOG_WRN("%s: llama_decode returned %d\n", __func__, ret);
+            auto * mem_dft = llama_get_memory(ctx_dft);
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (i_block_beg[seq_id] < 0) {
+                    continue;
+                }
+                const llama_pos actual_start = batch.pos[i_block_beg[seq_id]];
+                const llama_pos pos_min = llama_memory_seq_pos_min(mem_dft, seq_id);
+                const llama_pos pos_max = llama_memory_seq_pos_max(mem_dft, seq_id);
+                const llama_pos expected_start = pos_max >= 0 ? pos_max + 1 : actual_start;
+                LOG_ERR("%s: DFlash draft decode rejected rc=%d for seq_id=%d: "
+                        "expected_start=%d, actual_start=%d, kv_pos_min=%d, kv_pos_max=%d, "
+                        "injection_offset=0, n_tokens=%d\n",
+                        __func__, ret, (int) seq_id, (int) expected_start, (int) actual_start,
+                        (int) pos_min, (int) pos_max, (int) n_block[seq_id]);
+            }
             return;
         }
 
