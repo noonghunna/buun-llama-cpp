@@ -1,47 +1,90 @@
 # The spec-dec × CPU-offload challenge — measured bottleneck ledger
 
-**Mission:** make speculative decoding (DFlash) net-positive on this stack — single-stream and, if economically viable, multi-stream — when most expert weights live in CPU RAM. Reference platform: 2×3090 PCIe (no NVLink/P2P), Laguna-S-2.1 (118B/8B-active, top-10 of 256 experts, 48 layers), 28/48 expert layers CPU-offloaded, VRAM expert cache ~80% hits, turbo4 KV, 262K ctx, DFlash cross-attention drafter (GPU-resident, SWA-512).
+**Mission:** make speculative decoding (DFlash) net-positive on this stack — single-stream and, if economically viable, multi-stream — when most expert weights live in CPU RAM. Reference platform: 2×3090 PCIe (no NVLink/P2P), Laguna-S-2.1 (118B/8B-active, top-10 of 256 experts, 48 layers), expert layers CPU-offloaded, VRAM expert cache, turbo4 KV, 262K ctx, DFlash cross-attention drafter (GPU-resident, SWA-512).
 
-**Status quo (all first-party measured, 2026-07-28/29):**
+> **REVISION 2 (2026-07-29).** A three-way blind audit plus a device campaign overturned much of revision 1. Two engine bugs were found and fixed, several "measurements" turned out to be artifacts, and the headline cause was wrong. Corrections are marked ⛔ inline — **read them before proposing anything**, because revision 1's framing sent three auditors after the wrong term. Full history: `specconc-reconciliation.md`. **Current answer to the mission: on this platform, no.** Spec-dec is net-negative at every draft depth and every concurrency tested. The remaining question is whether the dominant fixed cost is removable.
+
+## Status quo — all first-party measured
+
+Single-stream, N=1, 262K, 19L CPU offload, median of rounds 2–7 (2026-07-29):
 
 | Configuration | TPS | Verdict |
 |---|---|---|
-| no-spec single-stream, shallow | **38.8** | the bar spec must beat |
-| spec draft-3 single-stream, shallow | ~34.8 (33–37 by acceptance draw) | **−9% — spec LOSES shallow** |
-| no-spec vs spec at ~99K depth | 26.5 vs **28.3** | **+7% — spec wins loaded**; crossover depth unmeasured |
-| no-spec `-np 4` aggregate | **74.3** (knee) | multi-lane crown |
-| spec `-np {2,3}` aggregate | 3.9–10.6 | **collapse 5–13×** (fork issue #13) |
+| no-spec | **39.0** | the bar spec must beat |
+| drafter loaded, `--draft-max 0` (runs, emits nothing) | **30.6** | **−21.5% — pure overhead, zero payoff.** The single most important number here |
+| spec draft-1 | 34.3 | −12.1% |
+| spec draft-2 | 33.4 | −14.4% |
+| spec draft-3 | 29.4 | −24.6% |
 
-## The core physics (constraint #1 — every failed idea below died on it)
+Concurrency, aggregate tok/s, spec arms use the default slot cap (only slot 0 speculates):
 
-Speculation pays when verifying K tokens costs ≈ one token. On GPU-resident models that holds. Here it does not: a K-token verify batch routes to the **union** of ~K×10 experts, and CPU miss streaming + cache pressure scale with that union while acceptance returns only ~2.1 tokens/round (draft-3). Measured casualties of this one curve: draft-5 (27.1) < draft-3 (33.9); draft-≥4 monotonic decay; spec < no-spec at shallow; spec×concurrency collapse. Depth flips the sign because attention cost grows with context while expert cost stays flat.
+| N | no-spec | spec | Δ |
+|---|---|---|---|
+| 1 | 31.6 | 24.0 | −24% |
+| 2 | 49.9 | 28.6 | −43% |
+| 4 | 53.7 | 34.3 | −36% |
+| 6 | 59.5 | 38.8 | −35% |
 
-**Any design that increases tokens-per-verify without addressing expert-union cost is pre-refuted.**
+⛔ **Corrections to revision 1's table:**
+- ~~"spec `-np {2,3}` aggregate 3.9–10.6 → collapse 5–13×"~~ — **not a performance result.** All 35 concurrent requests died HTTP 500 from a drafter-state bug (below). The figure was one surviving stream's partial tokens ÷ a wall that was ~80% prefill. Decomposed exactly: 2.0× (errored streams zeroed) × 4.6× (wall/decode) = 9.2× vs the 8.8× observed.
+- ~~"−9% shallow, spec loses"~~ — directionally right, wrong attribution. The −9% figure was draft-3-specific.
+- ~~"no-spec `-np 4` = 74.3, multi-lane crown"~~ — **treat as unproven.** Independent runs give 53.7 and 60.2. It was a single last-round headline (see house rules on probe noise). Do not quote it as a baseline.
+- "+7% at ~99K depth" (26.5 vs 28.3) stands but is a single pair on a config whose shallow numbers have since moved; crossover still unmeasured.
+
+## The core physics — REVISED
+
+Speculation pays when verifying K tokens costs ≈ one token, and when the drafter's own forward is cheap relative to the target's. On GPU-resident models both hold. Here **neither** does, and revision 1 named only the second one.
+
+**Dominant term — the drafter's own forward pass.** The `--draft-max 0` arm above carries *no* activation duplication and *no* verify widening, yet still costs 21.5%. A 6-block BF16 cross-attention drafter reading the context ring every step competes for exactly the GPU + PCIe bandwidth the expert-streaming pipeline needs — the scarce resource under CPU offload. Acceptance then buys back roughly half of it (30.6 → 34.3 at draft-1).
+
+**Second term — expert-union cost (revision 1's constraint #1, demoted).** A K-token verify batch routes to the union of ~K×10 experts, and CPU miss streaming scales with that union while acceptance returns ~2.1 tokens/round at draft-3. This is what makes depth *additionally* unprofitable (34.3 → 29.4 going draft-1 → draft-3), but it is **not** why spec loses at draft-1.
+
+**Why the same drafter wins GPU-resident.** DFlash is +27% on prose on the single-card Qwen config on this same rig. There, spare bandwidth absorbs the drafter forward. Under offload its fixed cost is charged at a premium while its benefit is unchanged. **This is the mission's central obstacle: the technique spends the resource this platform has least of.**
+
+Cost curve anchored on the measured α=1 point (better than a fitted intercept): `C(k) = TPS(d0)·α / TPS(d)` → **C(2)=1.41, C(3)=1.70, C(4)=2.19**. ⚠️ α values (1.58/1.85/2.10) are imported from earlier log measurements, not re-measured on this config.
+
+**Any design that increases tokens-per-verify without addressing expert-union cost is still pre-refuted — but a design that only addresses the union cannot make spec net-positive here either.** Break-even against no-spec needs ~45% of the verify-batch cost multiplier removed at draft-3 (~41% at draft-1).
 
 ## Measured constraint ledger
 
-1. **Acceptance:** draft-1 ≈ 51–61%, draft-2 ≈ 40–47%, draft-3 mean accepted length ≈ 2.1 (incl. bonus). Prose accepts better than code. Drafter itself is cheap (GPU, ~2.1 GB, KV ~112 MiB even at 262K — SWA ring).
-2. **Cache hook ceiling:** routing array `MOE_CACHE_MAX_TOPK=64` → verify batch ≤ 6 tokens at top-10 ((draft+1)×N_slots ≤ 6). Oversize = silent whole-cache bypass (now warns). Raising to 192 costs a **measured −4.5% base decode** (stack-array L1 pressure; the fusion post-mortem shows gate/up sharing can avoid part of it). `MAX_BATCH` env clamps at 8.
-3. **Spec-only activation duplication (~8×):** with >1 token per verify, the `shared_activation` fast path fails and up to n_hits activation rows are gathered/uploaded/quantized where only n_tokens are unique. Fix (token-minor padded grid) is in flight on `feat/spec-act-dedup` — currently failing its suite on the oversize-refusal boundary case (issue #12).
-4. **Sync/serialization background (partially fixed):** was ~84 blocking collect syncs per forward step; D2H-at-dispatch + parallel scatter (L1+L3, merged into `stack/sync-stage2`) recovered ~+5% single-stream and +23% at the no-spec batching knee. Remaining: ~500 CUDA API calls/step, host orchestration ≤7.8 ms/step upper bound. Fixed costs are per-STEP → spec's per-token share divides by α ≈ 2.1.
-5. **Multi-slot spec collapse (issue #13):** hypothesis = serial per-slot draft→verify in the server loop; **the hypothesis under-explains the data by ~7×** (arm C: 3.9 aggregate vs ~29 perfect-serialization arithmetic at its own 34.4 per-stream rate) — a second multiplier (drafter ring/capture thrash per slot switch? re-prefill? scheduler pathology?) is unidentified.
-6. **Regime dependence:** −9% shallow / +7% @99K; crossover unmeasured; continuous-soak p50 35.4 on the spec recipe (growing agentic sessions) — no-spec soak on the same protocol not yet run.
+1. **Acceptance:** draft-1 ≈ 51–61%, draft-2 ≈ 40–47%, draft-3 mean accepted length ≈ 2.1 (incl. bonus). Prose accepts better than code.
+2. **Drafter residency and forward cost (NEW, dominant).** BF16 drafter ≈ 2.1 GB, layer-split 1346 MiB CUDA0 + 781 MiB CUDA1. Costs **−21.5% before producing a single usable token**. It also displaces expert-cache pool (2117 → 647 slots at N=1) — but ⛔ **pool displacement is NOT the throughput driver**: restoring the pool (619→1201 via `RESERVE_MB=1024`, or 828 via `-devd CUDA1`) left throughput flat at 29–31. Bandwidth/compete, not capacity.
+3. **Cache hook ceiling:** `MOE_CACHE_MAX_TOPK=64` at `ggml-cpu.c:1495` → verify batch ≤ 6 tokens at top-10. ⛔ **Correction:** the live constraint is `(draft+1)·top_k ≤ 64` → draft ≤ 5, with **no `N_slots` factor** — `force_split_seq` keeps ubatches per-sequence, so the `×N_slots` form only becomes true *if* cross-slot verify batching is ever built. Raising to 192 costs a measured **−4.5% base decode**.
+4. **A second, independent refusal path** at `moe-cache.cu:1316`: `n_tokens > max_batch` (env clamps [1,8]). **`MAX_BATCH` must be ≥ `draft_max+1`**, or the hook bypasses every decode, no pool is ever created, and the run silently measures *spec with no expert cache*. This cost a full benchmark arm (read −30%). Now warns once — `fix/moe-cache-batch-bypass-warn`.
+5. **Spec-only activation duplication (~8×):** with >1 token per verify the `shared_activation` fast path fails and up to n_hits activation rows are gathered/uploaded/quantized where only n_tokens are unique. Fix in flight on `feat/spec-act-dedup` (issue #12), failing two device tests. Targets term two, **not** the dominant term.
+6. **Sync/serialization (partially fixed):** was ~84 blocking collect syncs per forward step; D2H-at-dispatch + parallel scatter (L1+L3, `stack/sync-stage2`) recovered ~+5% single-stream and +23% at the no-spec batching knee. Remaining: ~500 CUDA API calls/step. Fixed costs are per-STEP → spec's per-token share divides by α.
+7. ⛔ **Multi-slot "collapse" (issue #13) — was a crash, now FIXED.** `common_speculative_draft()` hard-coded `spec->dparams[0]` while `common_speculative_set_seq_id()` was a no-op for the `DRAFT_DFLASH` contract that a drafter GGUF declaring `general.architecture=dflash` auto-selects. Every slot drafted into drafter sequence 0 → guaranteed KV-lineage collision at N≥2 → abort within 9–80 decoded tokens. Fixed by `fix/draft-dflash-seq-routing` + `fix/draft-dflash-slot-cap`. Validated with a pre-fix control: **0/8 requests survived before, 8/8 after**, drafter seq usage 119/0 → 383/376, and 0 errors across all 8 arms of the concurrency sweep. Multi-slot spec is now *correct*; it is still **−12.5% vs the one-slot floor**, i.e. correctness, not a win.
 
 ## Refuted / dead (measured or source-proven — do not respend)
 
-- Event-ring non-blocking collect (zero deferral slack; consumer is the next CPU node).
-- CUDA graphs on this path (CPU-backend hook; multi-device early-return).
-- Cross-device layer parallelism (serial layer chain); drafter device pinning (pool redistribution eats the PCIe-hop saving).
-- Wider PCIe transfers (KB-scale, latency-dominated).
-- draft-max ≥ 4 (expert-union decay); MTP-style built-in drafters on MoE at TP=2 (−45/−51% history).
-- More CPU threads (t=28 optimal on 32C; contention beyond).
+**From revision 1, still dead:** event-ring non-blocking collect · CUDA graphs on this path · cross-device layer parallelism · drafter device pinning · wider PCIe transfers · draft-max ≥ 4 · built-in MTP drafters on MoE at TP=2 · threads ≠ 28.
 
-## The open design space (where the audits should live)
+**Newly refuted (2026-07-29):**
+- ⛔ **"Serial per-slot draft→verify with no cross-slot batching."** Half-true and mislocated. `common_speculative_draft_batch()` and `llama_set_force_split_seq(ctx,false)` both exist — but are gated on the fork `DFLASH` type, so they are dead code for `DRAFT_DFLASH`. Not physics; a type gate.
+- ⛔ **The "~7× unexplained multiplier."** Does not exist (see status-quo corrections).
+- ⛔ **Pool starvation as the cause of the spec penalty.** Refuted by two mitigation arms.
+- ⛔ **`dflash_tape_active` global-OR** (non-speculating slots paying the tape write). Gated on `type() == COMMON_SPECULATIVE_TYPE_DFLASH` at `server-context.cpp:4771`; never fires for Laguna.
+- ⛔ **"draft-1/draft-2 at parity with no-spec."** Derived from shallow warm-up requests; does **not** reproduce on a 262K CPU-offload serving config, where draft-1 is −12.1% with non-overlapping ranges.
+- ⛔ **`--spec-p-min` confidence truncation as a win.** Its best case degenerates toward draft-1, which is already a 12% loss. It cannot beat a negative number. (The feature is real and already implemented at `speculative.cpp:1321`, shipped disabled — it just cannot help *here*.)
+- ⛔ **Depth-adaptive spec policy.** Best available pick is draft-1, still −12.1%. No depth schedule is net-positive on this platform.
+- ⛔ **Union-aware / cache-resident-aware draft selection, as specified.** A token's expert route depends on the target's residual stream at that position; DFlash is a *dense* 6-block decoder with no router to read. Only surviving path is an offline discriminator on `routing_trace.pt` (is a token's realised expert set predictable from token id alone?) — zero rig time, answers whether the branch is real.
+- **Cross-slot verify batching: DON'T BUILD** — unanimous across three independent audits. Five prerequisites including a measured −4.5% rig-wide array tax, for an envelope that cannot clear +10% against the no-spec baseline it must beat.
 
-- **α improvement at fixed batch cost:** dynamic draft length by rolling acceptance; entropy/temperature-aware drafting; stop-draft-on-low-confidence. Raises tokens/round without widening the union.
-- **Union-aware speculation:** can the drafter (or a router-lookahead) prefer draft tokens whose expert routes overlap the batch's existing union or the cache's resident set? Speculative tokens are *optional* work — choosing cheaper-to-verify tokens is legal in a way normal decode can't.
-- **Depth-adaptive spec:** auto-enable past the measured crossover (needs the crossover arm); trivially shippable as policy.
-- **Multi-slot:** verify/refute the serialization + find the 7× multiplier; cross-slot verify batching design + honest envelope (prereqs: topk-192 with array-tax mitigation, MAX_BATCH raise, unique-activation indexing); cheaper intermediates (persistent per-slot drafter state, spec-on-one-slot, auto spec-off fallback ≥2 active slots as the do-no-harm floor).
-- **Economics gate:** every proposal must state its expected envelope against 38.8 (single shallow) / 26.5→28.3 (loaded) / 74.3 (multi-lane no-spec). "Don't build X" with arithmetic is a first-class deliverable.
+## The open design space
 
-House rules for any resulting work: one mechanism per branch; no inserted timers on hot paths (−22% A/A-proven observer effect); end-to-end TPS only, ≥10% margin or A/B/A (±10–12% between-boot variance under spec; a 3-boot A/A band exists); suites must pass on the branch's own base before stacking.
+Only two levers remain that could flip the sign, and they are unequal:
+
+- **Reduce the drafter's per-step cost (attacks the dominant −21.5%).** Drafter Q8_0 is the cheap first probe — roughly halves bytes moved per forward. Beyond that: fewer drafter blocks, shorter cross-attention window, or skipping the drafter forward on steps unlikely to accept. **This is where the mission lives now.**
+- **Reduce verify-batch cost (attacks the second term).** `feat/spec-act-dedup` — must remove ~45% of the multiplier at draft-3 to reach break-even. Worth landing for correctness and for deeper drafts; **cannot on its own make spec net-positive.**
+
+**Economics gate:** every proposal states its envelope against **39.0** (single-stream no-spec) and the concurrency table above. Score proposals on Δ(unique activation rows) and Δ(drafter forward cost), not Δ(tokens). "Don't build X" with arithmetic is a first-class deliverable.
+
+## House rules for any resulting work
+
+One mechanism per branch; no inserted timers on hot paths (−22% A/A-proven observer effect); end-to-end TPS only; suites must pass on the branch's own base before stacking; **compile-clean is not evidence** — resource-lifetime bugs on this path only appear on device.
+
+**Measurement rules (learned expensively):**
+- `MAX_BATCH ≥ draft_max+1` or you are benching a disabled cache. Check for `[moe-cache] … pool[…] slots=` lines in the boot log; their absence means the cache never engaged. Requires `-lv 4`.
+- The concurrency probe reports `agg_by_round[-1]` — **last round only**. Measured round-to-round spread: **~29% for multi-stream aggregates**, ~6% at N=1. Two boots of an identical no-spec N=2 config gave 44.6 and 49.9. Use median-of-rounds; only deltas >12% are real from single-boot multi-stream data.
+- An arm with `clean=0` is a hard stop, never a TPS row. The probe now emits `NaN` when any round errors (club-3090 #820).
+- The probe's N streams are near-duplicate prompts at temperature 0 — maximal expert-union overlap across slots. Every multi-stream number here is a best case.
