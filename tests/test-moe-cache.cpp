@@ -290,7 +290,11 @@ static bool run_scenario(
         }
         ggml_backend_tensor_get(
                 graph.out, actual.data(), 0, actual.size() * sizeof(float));
-        if (!compare_output(reference, actual, 5e-4)) {
+        const bool exact_dispatch_fallback =
+            fail_stage && strcmp(fail_stage, "dispatch") == 0;
+        if (exact_dispatch_fallback
+                ? memcmp(reference.data(), actual.data(), actual.size() * sizeof(float)) != 0
+                : !compare_output(reference, actual, 5e-4)) {
             fprintf(stderr, "%s: output mismatch at step %d\n", name, step);
             output_ok = false;
             break;
