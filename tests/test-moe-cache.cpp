@@ -292,7 +292,9 @@ static bool run_scenario(
                 graph.out, actual.data(), 0, actual.size() * sizeof(float));
         const bool exact_dispatch_fallback =
             fail_stage && strcmp(fail_stage, "dispatch") == 0;
-        if (exact_dispatch_fallback
+        const bool exact_collect_fallback =
+            fail_stage && strcmp(fail_stage, "collect") == 0;
+        if ((exact_dispatch_fallback || exact_collect_fallback)
                 ? memcmp(reference.data(), actual.data(), actual.size() * sizeof(float)) != 0
                 : !compare_output(reference, actual, 5e-4)) {
             fprintf(stderr, "%s: output mismatch at step %d\n", name, step);

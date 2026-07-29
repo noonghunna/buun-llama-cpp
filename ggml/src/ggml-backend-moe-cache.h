@@ -34,9 +34,14 @@ struct ggml_moe_cache_api {
     int (*dispatch)(void * node, int wtype, int64_t n_in, int64_t n_out, int n_hits,
                     const int32_t * slot_idx, const float * const * act_rows);
 
-    // Copy GPU results into dst_rows. On 0, the caller must recompute every
-    // skipped row on the CPU.
-    int (*collect)(void * node, int n_hits, float * const * dst_rows, int64_t n_out);
+    // Wait for GPU results. On 0, the caller must recompute every skipped row
+    // on the CPU and must not call collect_scatter.
+    int (*collect_wait)(void * node, int n_hits, float * const * dst_rows, int64_t n_out);
+
+    // Copy a strided share of the completed GPU rows into dst_rows. Every
+    // worker calls this only after collect_wait succeeds and a shared barrier.
+    void (*collect_scatter)(void * node, int ith, int nth, int n_hits,
+                            float * const * dst_rows, int64_t n_out);
 
     // Releases slot pins and all per-node ownership. Must be called exactly
     // once for every non-NULL begin result, on every success or failure path.

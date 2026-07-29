@@ -1866,7 +1866,7 @@ static int moe_cache_dispatch(
     return 1;
 }
 
-static int moe_cache_collect(
+static int moe_cache_collect_wait(
         void * opaque, int n_hits, float * const * dst_rows, int64_t n_out) {
     moe_cache_node * node = (moe_cache_node *)opaque;
     if (!node || !node->dispatched || n_hits <= 0 || n_hits > 64 ||
@@ -1896,13 +1896,6 @@ static int moe_cache_collect(
     }
     node->dispatched = false;
 
-    if (ok) {
-        for (int index = 0; index < n_hits; index++) {
-            memcpy(dst_rows[index], device.h_out + (size_t)index * n_out,
-                   n_out * sizeof(float));
-        }
-    }
-
     {
         std::lock_guard<std::mutex> lock(session.mu);
         if (!ok) {
@@ -1915,6 +1908,25 @@ static int moe_cache_collect(
         }
     }
     return ok ? 1 : 0;
+}
+
+static void moe_cache_collect_scatter(
+        void * opaque, int ith, int nth, int n_hits,
+        float * const * dst_rows, int64_t n_out) {
+    moe_cache_node * node = (moe_cache_node *)opaque;
+    if (!node || node->dispatched || ith < 0 || nth <= 0 || ith >= nth ||
+        n_hits <= 0 || n_hits > 64 || n_hits != node->n_pins ||
+        !dst_rows || n_out != node->n_out) {
+        return;
+    }
+    for (int index = ith; index < n_hits; index += nth) {
+        if (!dst_rows[index]) {
+            return;
+        }
+        memcpy(dst_rows[index],
+               node->device->h_out + (size_t)index * n_out,
+               n_out * sizeof(float));
+    }
 }
 
 static void moe_cache_end(void * opaque) {
@@ -2110,7 +2122,8 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.begin = moe_cache_begin;
     ggml_moe_cache.plan = moe_cache_plan;
     ggml_moe_cache.dispatch = moe_cache_dispatch;
-    ggml_moe_cache.collect = moe_cache_collect;
+    ggml_moe_cache.collect_wait = moe_cache_collect_wait;
+    ggml_moe_cache.collect_scatter = moe_cache_collect_scatter;
     ggml_moe_cache.end = moe_cache_end;
     ggml_moe_cache.invalidate = moe_cache_invalidate;
 }
