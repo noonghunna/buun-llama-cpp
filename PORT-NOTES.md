@@ -202,3 +202,18 @@ left in place. Recommended owner-run validation order remains:
 | Delta | Why | Upstream status |
 |---|---|---|
 | `AGENTS.md` (new) + 3-line pointer prepended to upstream `CLAUDE.md` | fork process contract for agents (policy #10 distillation); pointer keeps single-discovery-path — CLAUDE.md remains buun's content otherwise | ours (never upstreamed; drop pointer if buun adds his own AGENTS.md) |
+
+## Sync-latency Stage 2 — D2H at dispatch
+
+**Upstream status:** ours — issue #12; device validation pending.
+
+Branch `probe/d2h-at-dispatch` moves the asynchronous result download from
+`moe_cache_collect` to immediately after the expert matvec launch in
+`moe_cache_dispatch`. The single compute stream preserves ordering; CPU miss
+rows can now overlap the download, while collect retains the same blocking
+synchronization, scatter, fault fallback, and pin-lifetime contracts.
+
+This is issue #12's first isolated mechanism. No CUDA kernel or shared MMVQ
+code changed. GPU execution remains intentionally deferred to the maintainer;
+the required device gate is `GGML_CUDA_MOE_CACHE_FAIL=dispatch` versus cache
+mode off, followed by the cumulative three-arm benchmark.

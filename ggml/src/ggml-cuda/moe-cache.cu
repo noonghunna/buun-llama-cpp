@@ -1848,6 +1848,12 @@ static int moe_cache_dispatch(
         ok = moe_cache_cuda_ok(
                 device, cudaPeekAtLastError(), "expert matvec launch", true);
     }
+    if (ok) {
+        ok = moe_cache_cuda_ok(device, cudaMemcpyAsync(
+                device.h_out, device.d_out, out_bytes,
+                cudaMemcpyDeviceToHost, device.compute_stream),
+                "output download", true);
+    }
 
     if (!ok) {
         cudaStreamSynchronize(device.compute_stream);
@@ -1880,12 +1886,6 @@ static int moe_cache_collect(
     bool ok = !device.dead.load();
     if (moe_cache_fail(session, "collect")) {
         ok = false;
-    }
-    const size_t bytes = (size_t)n_hits * n_out * sizeof(float);
-    if (ok) {
-        ok = moe_cache_cuda_ok(device, cudaMemcpyAsync(
-                device.h_out, device.d_out, bytes,
-                cudaMemcpyDeviceToHost, device.compute_stream), "output download", true);
     }
     if (ok) {
         ok = moe_cache_cuda_ok(
