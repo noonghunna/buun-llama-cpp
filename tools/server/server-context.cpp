@@ -1155,6 +1155,10 @@ private:
                 SRV_ERR("failed to reinit speculative context: %s\n", e.what());
             }
 
+            // NOTE: this re-attaches the shared spec to every slot, bypassing the
+            // DFlash slot caps applied at init. Safe only because the branch is
+            // guarded on mtp_was_active_before_swap and recreates an *MTP* drafter —
+            // a DFlash drafter never reaches here. Re-apply the cap if that changes.
             for (server_slot & slot : slots) {
                 slot.ctx_dft = ctx_dft.get();
                 if (spec) {
@@ -1904,6 +1908,25 @@ private:
             }
         }
 
+        // Same cap for DRAFT_DFLASH — the upstream encoder/KV-injection contract that a drafter
+        // GGUF declaring `general.architecture=dflash` auto-selects. That contract shares ONE
+        // common_speculative across slots (per-slot common_speculative_init returns null for it,
+        // so every slot lands on `spec_shared`), and the shared drafter's per-seq draft state has
+        // a single writer only while one slot speculates. Deliberately a SEPARATE counter from
+        // dflash_slots_cap: that one also switches on fork-DFLASH machinery this contract must not
+        // get (shared drafter ctx above, llama_dflash_allocate_slots below) and gates the shared
+        // `spec` init on `!dflash_slots_cap` — the very object DRAFT_DFLASH needs.
+        int draft_dflash_slots_cap = 0;
+        if (can_spec && params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) {
+            draft_dflash_slots_cap = std::max(1, std::min(params_base.speculative.dflash_max_slots, params_base.n_parallel));
+            if (draft_dflash_slots_cap < params_base.n_parallel) {
+                SRV_INF("DFlash (draft-dflash) enabled for slots 0..%d; slots %d+ will use non-speculative decode\n",
+                        draft_dflash_slots_cap - 1, draft_dflash_slots_cap);
+            } else {
+                SRV_INF("DFlash (draft-dflash) enabled for all %d slots\n", draft_dflash_slots_cap);
+            }
+        }
+
         // setup slots
         SRV_INF("initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s'\n",
                 params_base.n_parallel, n_ctx_slot, params_base.kv_unified ? "true" : "false");
@@ -1948,7 +1971,8 @@ private:
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
 
             const bool slot_can_spec = can_spec &&
-                (params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH || i < dflash_slots_cap);
+                (params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH       || i < dflash_slots_cap) &&
+                (params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || i < draft_dflash_slots_cap);
 
             if (is_diffusion) {
                 slot.diff_self_spec = true;
