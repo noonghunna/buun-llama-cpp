@@ -1896,8 +1896,8 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
             const bool cd_passed  = arg_passed({"-cd", "--ctx-size-draft"});
 
             if (!cd_passed && params.speculative.draft.n_ctx == 0) {
-                LOG_INF("dflash: setting -cd to 256 (drafter doesn't need the full main ctx; pass -cd N to override)\n");
-                params.speculative.draft.n_ctx = 256;
+                LOG_INF("dflash: PROBE PATCH r11: leaving draft n_ctx=0 so server falls back to target n_ctx_seq (drafter tracks absolute positions; any fixed cap dies at depth)\n");
+                // params.speculative.draft.n_ctx stays 0 -> server-context.cpp:1645 target-n_ctx fallback
             }
             bool capped = false;
             if (!b_passed && params.n_batch > 256) {
