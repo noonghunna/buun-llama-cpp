@@ -35,20 +35,38 @@ Concurrency, aggregate tok/s, spec arms use the default slot cap (only slot 0 sp
 
 Speculation pays when verifying K tokens costs ≈ one token, and when the drafter's own forward is cheap relative to the target's. On GPU-resident models both hold. Here **neither** does, and revision 1 named only the second one.
 
-**Dominant term — the drafter's own forward pass.** The `--draft-max 0` arm above carries *no* activation duplication and *no* verify widening, yet still costs 21.5%. A 6-block BF16 cross-attention drafter reading the context ring every step competes for exactly the GPU + PCIe bandwidth the expert-streaming pipeline needs — the scarce resource under CPU offload. Acceptance then buys back roughly half of it (30.6 → 34.3 at draft-1).
+**Term one — drafter + capture overhead (DFlash-specific).** The `--draft-max 0` arm carries *no* activation duplication and *no* verify widening — the draft is empty, so the target batch is 1 token, **identical target work to no-spec** — yet it still costs 21.5%. ⚠️ **This is NOT an expert-path cost.** The drafter is dense and GPU-resident (no `ffn_*_exps` tensors); it never runs an offloaded expert and cannot compete with expert streaming. The 21.5% is the drafter's own dense GPU forward serially added to each step, plus the capture path on the target (hidden-state extraction every decode). d0 does not separate those two. Acceptance buys back roughly half (30.6 → 34.3 at draft-1). **Model-free drafters pay ~none of this term** — and are still net-negative, which is what identifies term two as the binding constraint.
 
 **Second term — expert-union cost (revision 1's constraint #1, demoted).** A K-token verify batch routes to the union of ~K×10 experts, and CPU miss streaming scales with that union while acceptance returns ~2.1 tokens/round at draft-3. This is what makes depth *additionally* unprofitable (34.3 → 29.4 going draft-1 → draft-3), but it is **not** why spec loses at draft-1.
 
-**Why the same drafter wins GPU-resident.** DFlash is +27% on prose on the single-card Qwen config on this same rig. There, spare bandwidth absorbs the drafter forward. Under offload its fixed cost is charged at a premium while its benefit is unchanged. **This is the mission's central obstacle: the technique spends the resource this platform has least of.**
+**Only the TARGET touches offloaded experts.** Every target forward routes the MoE layers: a no-spec decode routes top-10 for one token, a K-token verify routes the union of ~K×10. That is the whole of the CPU-offload penalty, and it is paid on the **verify**, per round. **Therefore wins can only come from: cheaper verify (lower C(k)), higher α at fixed verify width, or not verifying wide multi-token batches.** ⛔ "A drafter that avoids the experts" is NOT a lever — no drafter ever touched them. (DFlash is +27% on prose GPU-resident on this same rig because term one is cheap relative to a fast target there, not because of anything expert-related.)
 
 Cost curve anchored on the measured α=1 point (better than a fitted intercept): `C(k) = TPS(d0)·α / TPS(d)` → **C(2)=1.41, C(3)=1.70, C(4)=2.19**. ⚠️ α values (1.58/1.85/2.10) are imported from earlier log measurements, not re-measured on this config.
 
 **Any design that increases tokens-per-verify without addressing expert-union cost is still pre-refuted — but a design that only addresses the union cannot make spec net-positive here either.** Break-even against no-spec needs ~45% of the verify-batch cost multiplier removed at draft-3 (~41% at draft-1).
 
+## Model-free drafters — measured, and they settle where the binding constraint is
+
+Eight drafters that run **no forward pass at all** (`suffix`, `copyspec`, `recycle`, four `ngram-*`). They pay ~none of term one. Laguna supports exactly this family and no other: it has **no `nextn`/MTP head**, no EAGLE3 drafter, and no small vocab-compatible draft model exists. Single-stream N=1, prose workload, vs no-spec 38.68:
+
+| drafter | tok/s | vs no-spec | acceptance |
+|---|---|---|---|
+| ngram-map-k | 37.41 | −3.3% | 0.04 |
+| ngram-simple | 35.54 | −8.1% | **0.00** |
+| ngram-map-k4v | 35.46 | −8.3% | 0.02 |
+| copyspec | 35.22 | −8.9% | **0.45** (issues drafts on only ~1% of steps) |
+| ngram-mod | 33.36 | −13.8% | 0.19 |
+| suffix | 27.79 | −28.2% | 0.11 (drafts on nearly every step) |
+| ngram-cache | 27.70 | −28.4% | 0.13 |
+
+**All net-negative, and throughput tracks INACTIVITY rather than skill** — the best-looking arm accepted nothing at all. Removing the drafter cost entirely is therefore *not sufficient*: the binding constraint is verify economics, exactly as term two predicts. Only `copyspec` shows real signal, and it does so by **abstaining** — 45% acceptance on the rare prose steps that offer a copy match.
+
+**Break-even for a zero-cost drafter is `α ≥ C(k)`.** At the measured C(2)=1.41 that is **41% acceptance at draft-1**, which only copyspec approaches. ⚡ **This makes cheaper verify the multiplier on the whole family:** if act-dedup drives C(2) toward ~1.15, break-even falls to ~15% acceptance — a bar `suffix` (11%), `ngram-cache` (13%) and `ngram-mod` (19%) already sit at or above. Lowering C(k) does not merely improve its own arm; it decides whether model-free speculation becomes viable at all.
+
 ## Measured constraint ledger
 
 1. **Acceptance:** draft-1 ≈ 51–61%, draft-2 ≈ 40–47%, draft-3 mean accepted length ≈ 2.1 (incl. bonus). Prose accepts better than code.
-2. **Drafter residency and forward cost (NEW, dominant).** BF16 drafter ≈ 2.1 GB, layer-split 1346 MiB CUDA0 + 781 MiB CUDA1. Costs **−21.5% before producing a single usable token**. It also displaces expert-cache pool (2117 → 647 slots at N=1) — but ⛔ **pool displacement is NOT the throughput driver**: restoring the pool (619→1201 via `RESERVE_MB=1024`, or 828 via `-devd CUDA1`) left throughput flat at 29–31. Bandwidth/compete, not capacity.
+2. **Drafter residency and forward cost (NEW, dominant).** BF16 drafter ≈ 2.1 GB, layer-split 1346 MiB CUDA0 + 781 MiB CUDA1. Costs **−21.5% before producing a single usable token**. It also displaces expert-cache pool (2117 → 647 slots at N=1) — but ⛔ **pool displacement is NOT the throughput driver**: restoring the pool (619→1201 via `RESERVE_MB=1024`, or 828 via `-devd CUDA1`) left throughput flat at 29–31. ⛔ Nor is it bandwidth competition with expert streaming (the drafter is dense and GPU-resident and never enters that path). The cost is the drafter's own forward + the target-side capture path.
 3. **Cache hook ceiling:** `MOE_CACHE_MAX_TOPK=64` at `ggml-cpu.c:1495` → verify batch ≤ 6 tokens at top-10. ⛔ **Correction:** the live constraint is `(draft+1)·top_k ≤ 64` → draft ≤ 5, with **no `N_slots` factor** — `force_split_seq` keeps ubatches per-sequence, so the `×N_slots` form only becomes true *if* cross-slot verify batching is ever built. Raising to 192 costs a measured **−4.5% base decode**.
 4. **A second, independent refusal path** at `moe-cache.cu:1316`: `n_tokens > max_batch` (env clamps [1,8]). **`MAX_BATCH` must be ≥ `draft_max+1`**, or the hook bypasses every decode, no pool is ever created, and the run silently measures *spec with no expert cache*. This cost a full benchmark arm (read −30%). Now warns once — `fix/moe-cache-batch-bypass-warn`.
 5. **Spec-only activation duplication (~8×):** with >1 token per verify the `shared_activation` fast path fails and up to n_hits activation rows are gathered/uploaded/quantized where only n_tokens are unique. Fix in flight on `feat/spec-act-dedup` (issue #12), failing two device tests. Targets term two, **not** the dominant term.
