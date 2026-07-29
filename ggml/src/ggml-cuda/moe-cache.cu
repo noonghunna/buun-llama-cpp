@@ -1313,10 +1313,37 @@ static void * moe_cache_begin(
     moe_cache_session * session = g_session_stack.back().active;
     if (!session || session->stopping || session->dormant || !name || !host_base ||
         !strstr(name, "_exps") || n_tokens < 1 ||
-        n_tokens > session->config.max_batch ||
         expert_size < session->config.min_expert_bytes ||
         n_in <= 0 || n_out <= 0 || n_expert <= 0 ||
         !moe_cache_type_supported((ggml_type)wtype)) {
+        return nullptr;
+    }
+
+    // Checked apart from the rejects above so a MISCONFIGURED clamp can be reported.
+    // Silently refusing every decode is indistinguishable from "cache enabled but
+    // useless": pools are allocated lazily at the first eligible decode, so when this
+    // clamp always trips, no pool is ever created and no [moe-cache] pool line is ever
+    // logged. Speculative decoding walks straight into it — each sequence's verify
+    // batch is draft_max+1 tokens, so pairing --draft-max with the default max_batch=1
+    // disables the expert cache entirely with no diagnostic.
+    //
+    // Only decode-sized batches are worth reporting. Prefill is cache-blind BY DESIGN
+    // (a 2048-token ubatch is always far over the clamp), so warning on every oversize
+    // batch would fire on the first request of every run and train users to ignore it.
+    // MOE_CACHE_DECODE_BATCH_MAX bounds what can plausibly be a decode batch: top-k
+    // routing caps a usable batch near 6, and draft depth is single digits.
+    if (n_tokens > session->config.max_batch) {
+        constexpr int MOE_CACHE_DECODE_BATCH_MAX = 32;
+        if (n_tokens <= MOE_CACHE_DECODE_BATCH_MAX) {
+            static std::atomic<bool> warned{false};
+            if (!warned.exchange(true)) {
+                GGML_LOG_WARN("[moe-cache] bypassing cache: decode batch of %d tokens exceeds "
+                              "GGML_CUDA_MOE_CACHE_MAX_BATCH=%d — raise it to at least the "
+                              "largest decode batch (with speculative decoding that is "
+                              "draft_max+1). The expert cache stays inactive while this holds.\n",
+                              n_tokens, session->config.max_batch);
+            }
+        }
         return nullptr;
     }
 
