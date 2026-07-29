@@ -202,3 +202,21 @@ left in place. Recommended owner-run validation order remains:
 | Delta | Why | Upstream status |
 |---|---|---|
 | `AGENTS.md` (new) + 3-line pointer prepended to upstream `CLAUDE.md` | fork process contract for agents (policy #10 distillation); pointer keeps single-discovery-path — CLAUDE.md remains buun's content otherwise | ours (never upstreamed; drop pointer if buun adds his own AGENTS.md) |
+
+## Sync-latency Stage 2 — parallel result scatter
+
+**Upstream status:** ours — issue #12; device validation pending.
+
+Branch `feat/parallel-scatter` splits the internal collect vtable into
+`collect_wait` and `collect_scatter`. Thread 0 keeps ownership of result DMA,
+synchronization, failure accounting, and CPU fallback selection; after a
+barrier, all graph workers copy strided hit rows from pinned staging into the
+host destination. A second barrier keeps `end()` from releasing node ownership
+before the last worker finishes scattering.
+
+Only the node/count/status/row-pointer handoff lives in the shared MUL_MAT_ID
+work buffer; thread 0 retains the fixed 64-entry planning and fallback arrays,
+and graph-plan sizing accounts for the small shared state. No CUDA kernel or
+shared MMVQ code changed. GPU execution remains deferred; the maintainer gate is
+the existing determinism/cache-off comparison, `FAIL=collect` fallback test,
+then `compute-sanitizer --tool racecheck` on the prescribed small model.

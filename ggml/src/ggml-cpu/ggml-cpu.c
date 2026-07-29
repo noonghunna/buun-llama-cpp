@@ -1492,6 +1492,15 @@ struct mmid_row_mapping {
     int32_t i2;
 };
 
+enum { MOE_CACHE_MAX_TOPK = 64 };
+
+struct moe_cache_thread_state {
+    void *  node;
+    int     n_hits;
+    int     collect_ok;
+    float ** rows;
+};
+
 static void ggml_compute_forward_mul_mat_id_one_chunk(
     struct ggml_tensor * dst,
     const struct ggml_tensor * src0,
@@ -1597,8 +1606,6 @@ static void ggml_compute_forward_mul_mat_id(
     const int n_ids = ids->ne[0]; // n_expert_used
     const int n_as  = ne02;       // n_expert
 
-    // MoE expert cache state is used by thread 0 only.
-    enum { MOE_CACHE_MAX_TOPK = 64 };
     void *        moe_cache_node = NULL;
     int           moe_cache_n_hits = 0;
     int32_t       moe_cache_slot_idx[MOE_CACHE_MAX_TOPK];
@@ -1614,6 +1621,9 @@ static void ggml_compute_forward_mul_mat_id(
     if (src1->type != vec_dot_type) {
         incr_ptr_aligned(&wdata_cur, ggml_row_size(vec_dot_type, ggml_nelements(src1)), sizeof(int64_t));
     }
+
+    struct moe_cache_thread_state * moe_cache =
+        incr_ptr_aligned(&wdata_cur, sizeof(*moe_cache), sizeof(void *));
 
     int64_t * matrix_row_counts = // [n_as]
         incr_ptr_aligned(&wdata_cur, n_as*sizeof(int64_t), sizeof(int64_t));
@@ -1664,10 +1674,12 @@ static void ggml_compute_forward_mul_mat_id(
     }
 
     if (ith == 0) {
+        memset(moe_cache, 0, sizeof(*moe_cache));
         ggml_backend_buffer_t src0_buffer =
             src0->view_src ? src0->view_src->buffer : src0->buffer;
         if (ggml_moe_cache.begin && ggml_moe_cache.plan &&
-            ggml_moe_cache.dispatch && ggml_moe_cache.collect && ggml_moe_cache.end &&
+            ggml_moe_cache.dispatch && ggml_moe_cache.collect_wait &&
+            ggml_moe_cache.collect_scatter && ggml_moe_cache.end &&
             src0->op == GGML_OP_NONE && src0_buffer &&
             ggml_backend_buffer_get_usage(src0_buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
             src1->type == GGML_TYPE_F32 &&
@@ -1736,6 +1748,9 @@ static void ggml_compute_forward_mul_mat_id(
             ggml_moe_cache.end(moe_cache_node);
             moe_cache_node = NULL;
         }
+        moe_cache->node = moe_cache_node;
+        moe_cache->n_hits = moe_cache_n_hits;
+        moe_cache->rows = moe_cache_rows;
     }
 
     // reset current_chunk
@@ -1807,8 +1822,22 @@ static void ggml_compute_forward_mul_mat_id(
         }
     }
 
-    if (ith == 0 && moe_cache_node) {
-        if (!ggml_moe_cache.collect(moe_cache_node, moe_cache_n_hits, moe_cache_rows, ne0)) {
+    if (ith == 0 && moe_cache->node) {
+        moe_cache->collect_ok = ggml_moe_cache.collect_wait(
+                moe_cache->node, moe_cache->n_hits, moe_cache->rows, ne0);
+    }
+    if (moe_cache->node) {
+        ggml_barrier(params->threadpool);
+        if (moe_cache->collect_ok) {
+            ggml_moe_cache.collect_scatter(
+                    moe_cache->node, ith, nth, moe_cache->n_hits,
+                    moe_cache->rows, ne0);
+        }
+        ggml_barrier(params->threadpool);
+    }
+
+    if (ith == 0 && moe_cache->node) {
+        if (!moe_cache->collect_ok) {
             const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
             const size_t row_size = ggml_row_size(vec_dot_type, ne10);
             for (int i = 0; i < moe_cache_n_hits; i++) {
@@ -3001,6 +3030,8 @@ struct ggml_cplan ggml_graph_plan(
                         if (src1->type != vec_dot_type) {
                             cur += ggml_row_size(vec_dot_type, ggml_nelements(src1)) + sizeof(int64_t);
                         }
+                        // shared MoE cache state
+                        cur += sizeof(struct moe_cache_thread_state) + sizeof(void *);
                         // matrix_row_counts
                         cur += n_as * sizeof(int64_t) + sizeof(int64_t);
                         // matrix_rows
