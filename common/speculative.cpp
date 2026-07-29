@@ -4338,6 +4338,7 @@ llama_tokens common_speculative_draft(
         const common_params_speculative & params,
         const llama_tokens              & prompt_tgt,
         llama_token                       id_last,
+        llama_seq_id                      seq_id,
         std::vector<float>              * draft_log_probs,
         llama_pos                         n_past_override) {
     llama_tokens result;
@@ -4346,10 +4347,19 @@ llama_tokens common_speculative_draft(
         return result;
     }
 
+    if (seq_id < 0 || (size_t) seq_id >= spec->dparams.size()) {
+        LOG_ERR("%s: seq_id %d out of range (n_seq = %zu) - skipping draft\n",
+                __func__, seq_id, spec->dparams.size());
+        return result;
+    }
+
     spec->curr_impl = nullptr;
 
-    // set up dparams for seq 0
-    auto & dp = spec->dparams[0];
+    // Set up dparams for THIS caller's drafter sequence. The impl-side draft() walks every
+    // sequence and drafts the ones flagged `drafting`, using the loop index as the drafter
+    // seq for its KV ops (prepare_draft_append) — so this index is what keeps concurrent
+    // server slots off each other's drafter state.
+    auto & dp = spec->dparams[seq_id];
     dp.drafting = true;
     dp.n_max    = params.n_max;
     // M-RoPE: actual positions may exceed text token count due to image spatial dims
