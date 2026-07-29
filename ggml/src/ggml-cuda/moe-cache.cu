@@ -217,6 +217,7 @@ struct moe_cache_session {
     std::condition_variable idle_cv;
     std::atomic<bool> stopping{false};
     std::atomic<bool> dormant{false};
+    std::atomic<bool> oversize_warned{false};
     bool announced = false;
     int active_scopes = 0;
     int active_nodes = 0;
@@ -242,12 +243,18 @@ struct moe_cache_node {
     int64_t n_out = 0;
     int64_t n_expert = 0;
     int wtype = -1;
+    int n_tokens = 0;
     std::unique_lock<std::mutex> dispatch_lock;
     moe_cache_pin pins[64];
+    int32_t output_rows[64];
     int n_pins = 0;
+    int n_dispatch_hits = 0;
     bool planned = false;
     bool dispatched = false;
 };
+
+static_assert(sizeof(((moe_cache_node *)nullptr)->output_rows) /
+              sizeof(int32_t) == 64, "MoE cache output map must remain 64 entries");
 
 static std::mutex g_registry_mu;
 static std::unordered_set<moe_cache_session *> g_sessions;
@@ -1304,6 +1311,22 @@ static void moe_cache_session_leave(void * opaque) {
     }
 }
 
+static void moe_cache_oversize_refused(int n_ids, int64_t n_tokens) {
+    if (g_session_suppressed > 0 || g_session_stack.empty()) {
+        return;
+    }
+    moe_cache_session * session = g_session_stack.back().active;
+    if (!session || session->stopping.load() || session->dormant.load()) {
+        return;
+    }
+    if (!session->oversize_warned.exchange(true, std::memory_order_relaxed)) {
+        GGML_LOG_WARN(
+                "[moe-cache] disabled MUL_MAT_ID hook: %d experts x %lld"
+                " tokens exceeds the 64-row limit\n",
+                n_ids, (long long) n_tokens);
+    }
+}
+
 static void * moe_cache_begin(
         const char * name, const void * host_base, size_t expert_size,
         int64_t n_in, int64_t n_out, int wtype, int64_t n_expert, int64_t n_tokens) {
@@ -1565,6 +1588,7 @@ static void * moe_cache_begin(
     node->n_out = n_out;
     node->n_expert = n_expert;
     node->wtype = wtype;
+    node->n_tokens = (int)n_tokens;
     node->dispatch_lock = std::move(dispatch_lock);
     return node.release();
 }
@@ -1727,19 +1751,50 @@ static int moe_cache_dispatch(
         }
     }
 
-    bool shared_activation = true;
-    for (int index = 1; index < n_hits; index++) {
-        if (act_rows[index] != act_rows[0]) {
-            shared_activation = false;
-            break;
-        }
-    }
-    const int activation_rows = shared_activation ? 1 : n_hits;
+    const float * activation_sources[64] = {};
+    int hit_tokens[64];
+    int hits_per_token[64] = {};
+    int activation_count = 0;
     for (int index = 0; index < n_hits; index++) {
         if (slot_indices[index] < 0 || slot_indices[index] >= pool.n_slots ||
             !act_rows[index]) {
             return 0;
         }
+        int token = 0;
+        while (token < activation_count &&
+               activation_sources[token] != act_rows[index]) {
+            token++;
+        }
+        if (token == activation_count) {
+            if (activation_count >= node->n_tokens) {
+                return 0;
+            }
+            activation_sources[activation_count++] = act_rows[index];
+        }
+        hit_tokens[index] = token;
+        hits_per_token[token]++;
+    }
+
+    int n_topk = 0;
+    for (int token = 0; token < activation_count; token++) {
+        n_topk = std::max(n_topk, hits_per_token[token]);
+    }
+    if (n_topk <= 0 || node->n_tokens > 64 / n_topk) {
+        return 0;
+    }
+    const int dispatch_hits = n_topk * node->n_tokens;
+    const int activation_rows = node->n_tokens;
+    int32_t padded_slots[64];
+    int next_rank[64] = {};
+    for (int channel = 0; channel < dispatch_hits; channel++) {
+        padded_slots[channel] = slot_indices[0];
+        node->output_rows[channel] = -1;
+    }
+    for (int index = 0; index < n_hits; index++) {
+        const int token = hit_tokens[index];
+        const int channel = next_rank[token]++ * node->n_tokens + token;
+        padded_slots[channel] = slot_indices[index];
+        node->output_rows[channel] = index;
     }
 
     const int64_t padded_n_in =
@@ -1751,24 +1806,24 @@ static int moe_cache_dispatch(
         ggml_row_size((ggml_type)wtype, n_in) / type_size > INT_MAX ||
         padded_n_in / QK8_1 > INT_MAX ||
         (uint64_t)activation_rows * (padded_n_in / QK8_1) > INT_MAX ||
-        (uint64_t)n_out * n_hits > INT_MAX ||
+        (uint64_t)n_out * dispatch_hits > INT_MAX ||
         (uint64_t)(node->expert_size / type_size) * pool.n_slots > INT_MAX) {
         return 0;
     }
 
     if (n_in > INT64_MAX / activation_rows ||
         (uint64_t)n_in * activation_rows > SIZE_MAX / sizeof(float) ||
-        n_out > INT64_MAX / n_hits ||
-        (uint64_t)n_out * n_hits > SIZE_MAX / sizeof(float) ||
+        n_out > INT64_MAX / dispatch_hits ||
+        (uint64_t)n_out * dispatch_hits > SIZE_MAX / sizeof(float) ||
         (uint64_t)activation_rows * (padded_n_in / QK8_1) >
             SIZE_MAX / sizeof(block_q8_1)) {
         return 0;
     }
-    const size_t ids_bytes = (size_t)n_hits * sizeof(int32_t);
+    const size_t ids_bytes = (size_t)dispatch_hits * sizeof(int32_t);
     const size_t act_bytes = (size_t)activation_rows * n_in * sizeof(float);
     const size_t q8_bytes =
         (size_t)activation_rows * (padded_n_in / QK8_1) * sizeof(block_q8_1);
-    const size_t out_bytes = (size_t)n_hits * n_out * sizeof(float);
+    const size_t out_bytes = (size_t)dispatch_hits * n_out * sizeof(float);
 
     const size_t desired_caps[] = {
         moe_cache_growth_capacity(device.d_ids_cap, ids_bytes),
@@ -1814,12 +1869,13 @@ static int moe_cache_dispatch(
         return 0;
     }
 
-    for (int index = 0; index < n_hits; index++) {
-        device.h_ids[index] = slot_indices[index];
+    for (int index = 0; index < dispatch_hits; index++) {
+        device.h_ids[index] = padded_slots[index];
     }
     for (int index = 0; index < activation_rows; index++) {
         memcpy(device.h_act + (size_t)index * n_in,
-               act_rows[shared_activation ? 0 : index], n_in * sizeof(float));
+               activation_sources[index < activation_count ? index : 0],
+               n_in * sizeof(float));
     }
 
     (void)cudaGetLastError();
@@ -1843,7 +1899,7 @@ static int moe_cache_dispatch(
         ggml_cuda_moe_cache_mmv(
                 pool.slab, (ggml_type)wtype, (const char *)device.d_act_q8,
                 device.d_ids, device.d_out, n_in, n_out, pool.n_slots,
-                (int64_t)pool.expert_size, n_hits, activation_rows,
+                (int64_t)pool.expert_size, dispatch_hits, activation_rows,
                 device.compute_stream);
         ok = moe_cache_cuda_ok(
                 device, cudaPeekAtLastError(), "expert matvec launch", true);
@@ -1862,6 +1918,7 @@ static int moe_cache_dispatch(
         return 0;
     }
 
+    node->n_dispatch_hits = dispatch_hits;
     node->dispatched = true;
     return 1;
 }
@@ -1870,7 +1927,8 @@ static int moe_cache_collect_wait(
         void * opaque, int n_hits, float * const * dst_rows, int64_t n_out) {
     moe_cache_node * node = (moe_cache_node *)opaque;
     if (!node || !node->dispatched || n_hits <= 0 || n_hits > 64 ||
-        n_hits != node->n_pins || !dst_rows || n_out != node->n_out) {
+        n_hits != node->n_pins || node->n_dispatch_hits <= 0 ||
+        node->n_dispatch_hits > 64 || !dst_rows || n_out != node->n_out) {
         return 0;
     }
     for (int index = 0; index < n_hits; index++) {
@@ -1916,15 +1974,20 @@ static void moe_cache_collect_scatter(
     moe_cache_node * node = (moe_cache_node *)opaque;
     if (!node || node->dispatched || ith < 0 || nth <= 0 || ith >= nth ||
         n_hits <= 0 || n_hits > 64 || n_hits != node->n_pins ||
+        node->n_dispatch_hits <= 0 || node->n_dispatch_hits > 64 ||
         !dst_rows || n_out != node->n_out) {
         return;
     }
-    for (int index = ith; index < n_hits; index += nth) {
-        if (!dst_rows[index]) {
+    for (int channel = ith; channel < node->n_dispatch_hits; channel += nth) {
+        const int index = node->output_rows[channel];
+        if (index < 0) {
+            continue;
+        }
+        if (index >= n_hits || !dst_rows[index]) {
             return;
         }
         memcpy(dst_rows[index],
-               node->device->h_out + (size_t)index * n_out,
+               node->device->h_out + (size_t)channel * n_out,
                n_out * sizeof(float));
     }
 }
@@ -2119,6 +2182,7 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.session_destroy = moe_cache_session_destroy;
     ggml_moe_cache.session_enter = moe_cache_session_enter;
     ggml_moe_cache.session_leave = moe_cache_session_leave;
+    ggml_moe_cache.oversize_refused = moe_cache_oversize_refused;
     ggml_moe_cache.begin = moe_cache_begin;
     ggml_moe_cache.plan = moe_cache_plan;
     ggml_moe_cache.dispatch = moe_cache_dispatch;

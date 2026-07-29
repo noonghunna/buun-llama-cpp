@@ -18,6 +18,10 @@ struct ggml_moe_cache_api {
     void   (*session_enter)(void * session);
     void   (*session_leave)(void * session);
 
+    // Report a CPU-hook size refusal only when an active cache session owns
+    // the current scheduler scope. This callback must not acquire node state.
+    void (*oversize_refused)(int n_ids, int64_t n_tokens);
+
     // Begin one CPU MUL_MAT_ID node. Returns an opaque plan, or NULL when the
     // stock CPU path should handle the complete node.
     void * (*begin)(const char * tensor_name, const void * host_base, size_t expert_size,

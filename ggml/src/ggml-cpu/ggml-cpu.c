@@ -1675,6 +1675,8 @@ static void ggml_compute_forward_mul_mat_id(
 
     if (ith == 0) {
         memset(moe_cache, 0, sizeof(*moe_cache));
+        const bool moe_cache_oversized = n_ids > 0 &&
+            ids->ne[1] > MOE_CACHE_MAX_TOPK / n_ids;
         ggml_backend_buffer_t src0_buffer =
             src0->view_src ? src0->view_src->buffer : src0->buffer;
         if (ggml_moe_cache.begin && ggml_moe_cache.plan &&
@@ -1683,7 +1685,7 @@ static void ggml_compute_forward_mul_mat_id(
             src0->op == GGML_OP_NONE && src0_buffer &&
             ggml_backend_buffer_get_usage(src0_buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
             src1->type == GGML_TYPE_F32 &&
-            n_ids * ids->ne[1] <= MOE_CACHE_MAX_TOPK) {
+            !moe_cache_oversized) {
             moe_cache_node = ggml_moe_cache.begin(src0->name, src0->data, nb02,
                                                   ne00, ne01, (int) type, ne02, ids->ne[1]);
             if (moe_cache_node) {
@@ -1695,6 +1697,8 @@ static void ggml_compute_forward_mul_mat_id(
                 }
                 ggml_moe_cache.plan(moe_cache_node, expert_ids, (int)(n_ids * ids->ne[1]), moe_cache_slot_idx);
             }
+        } else if (ggml_moe_cache.oversize_refused && moe_cache_oversized) {
+            ggml_moe_cache.oversize_refused(n_ids, ids->ne[1]);
         }
 
         // initialize matrix_row_counts

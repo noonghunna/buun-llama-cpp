@@ -327,6 +327,180 @@ static bool run_scenario(
     return output_ok && stage_ok;
 }
 
+struct batch_fixture {
+    ggml_context * ctx = nullptr;
+    ggml_tensor * ids = nullptr;
+    ggml_tensor * activations = nullptr;
+    ggml_backend_buffer_t buffer = nullptr;
+    test_graph graph;
+    std::vector<float> reference;
+};
+
+static void free_batch_fixture(batch_fixture & fixture) {
+    free_graph(fixture.graph);
+    if (fixture.buffer) {
+        ggml_backend_buffer_free(fixture.buffer);
+    }
+    if (fixture.ctx) {
+        ggml_free(fixture.ctx);
+    }
+    fixture = {};
+}
+
+static bool init_batch_fixture(
+        batch_fixture & fixture,
+        ggml_backend_t cpu,
+        ggml_tensor * weights,
+        int top_k,
+        int tokens,
+        int empty_token) {
+    const ggml_init_params params = {
+        4 * ggml_tensor_overhead(),
+        nullptr,
+        true,
+    };
+    fixture.ctx = ggml_init(params);
+    if (!fixture.ctx) {
+        return false;
+    }
+    fixture.ids = ggml_new_tensor_2d(
+            fixture.ctx, GGML_TYPE_I32, top_k, tokens);
+    fixture.activations = ggml_new_tensor_3d(
+            fixture.ctx, GGML_TYPE_F32, n_in, 1, tokens);
+    ggml_set_name(fixture.ids, "moe_cache_batch_ids");
+    ggml_set_name(fixture.activations, "moe_cache_batch_activations");
+
+    fixture.buffer = ggml_backend_alloc_ctx_tensors(fixture.ctx, cpu);
+    if (!fixture.buffer) {
+        free_batch_fixture(fixture);
+        return false;
+    }
+
+    std::vector<int32_t> ids_data((size_t)top_k * tokens);
+    for (int token = 0; token < tokens; token++) {
+        for (int rank = 0; rank < top_k; rank++) {
+            ids_data[(size_t)token * top_k + rank] = token == empty_token
+                ? -1 : (token * top_k + rank) % n_expert;
+        }
+    }
+    ggml_backend_tensor_set(
+            fixture.ids, ids_data.data(), 0,
+            ids_data.size() * sizeof(ids_data[0]));
+
+    std::vector<float> activation_data(
+            ggml_nelements(fixture.activations));
+    for (int token = 0; token < tokens; token++) {
+        for (int64_t index = 0; index < n_in; index++) {
+            activation_data[(size_t)token * n_in + index] =
+                0.31f * std::sin((float)(index + 17 * token) * 0.043f) +
+                0.19f * std::cos((float)(index + 29 * token) * 0.071f);
+        }
+    }
+    ggml_backend_tensor_set(
+            fixture.activations, activation_data.data(), 0,
+            activation_data.size() * sizeof(float));
+
+    fixture.graph = make_graph(
+            cpu, weights, fixture.activations, fixture.ids);
+    if (!fixture.graph.ctx || !fixture.graph.buffer) {
+        free_batch_fixture(fixture);
+        return false;
+    }
+
+    set_env("GGML_CUDA_MOE_CACHE", "0");
+    if (ggml_backend_graph_compute(cpu, fixture.graph.graph) !=
+            GGML_STATUS_SUCCESS) {
+        free_batch_fixture(fixture);
+        return false;
+    }
+    fixture.reference.resize(ggml_nelements(fixture.graph.out));
+    ggml_backend_tensor_get(
+            fixture.graph.out, fixture.reference.data(), 0,
+            fixture.reference.size() * sizeof(float));
+    return true;
+}
+
+static bool run_batch_scenario(
+        ggml_backend_t cuda,
+        ggml_backend_t cpu,
+        ggml_tensor * weights,
+        int top_k,
+        int tokens,
+        int empty_token,
+        bool expect_cache,
+        log_capture & capture) {
+    batch_fixture fixture;
+    if (!init_batch_fixture(
+            fixture, cpu, weights, top_k, tokens, empty_token)) {
+        fprintf(stderr, "cache-batch-%d: fixture initialization failed\n", tokens);
+        return false;
+    }
+
+    configure_cache(nullptr);
+    const std::string max_batch = std::to_string(tokens);
+    set_env("GGML_CUDA_MOE_CACHE_MAX_BATCH", max_batch.c_str());
+    capture.clear();
+
+    ggml_backend_t backends[] = { cuda, cpu };
+    ggml_backend_sched_t scheduler = ggml_backend_sched_new(
+            backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, false);
+    if (!scheduler) {
+        free_batch_fixture(fixture);
+        return false;
+    }
+    ggml_backend_sched_set_tensor_backend(
+            scheduler, fixture.graph.out, cpu);
+    if (!ggml_backend_sched_alloc_graph(scheduler, fixture.graph.graph) ||
+        ggml_backend_sched_get_tensor_backend(
+            scheduler, fixture.graph.out) != cpu) {
+        ggml_backend_sched_free(scheduler);
+        free_batch_fixture(fixture);
+        return false;
+    }
+
+    const int steps = expect_cache ? max_steps : 4;
+    bool output_ok = true;
+    bool saw_hit = false;
+    std::vector<float> actual(fixture.reference.size());
+    for (int step = 0; step < steps; step++) {
+        if (ggml_backend_sched_graph_compute(
+                scheduler, fixture.graph.graph) != GGML_STATUS_SUCCESS) {
+            output_ok = false;
+            break;
+        }
+        ggml_backend_tensor_get(
+                fixture.graph.out, actual.data(), 0,
+                actual.size() * sizeof(float));
+        if (!compare_output(fixture.reference, actual, 5e-4)) {
+            output_ok = false;
+            break;
+        }
+        saw_hit = has_positive_field(capture.get(), "hits=");
+        if (saw_hit && step >= 8) {
+            break;
+        }
+        if (step >= 64) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+
+    ggml_backend_sched_free(scheduler);
+    const std::string log = capture.get();
+    const bool cache_ok = expect_cache
+        ? saw_hit
+        : !has_positive_field(log, "hits=") &&
+          count_occurrences(log, "disabled MUL_MAT_ID hook") == 1;
+    if (!output_ok || !cache_ok) {
+        fprintf(stderr, "cache-batch-%d: output/cache check failed\n%s",
+                tokens, log.c_str());
+    }
+    printf("cache-batch-%d%s: %s\n", tokens,
+            empty_token >= 0 ? "-empty" : "",
+            output_ok && cache_ok ? "OK" : "FAIL");
+    free_batch_fixture(fixture);
+    return output_ok && cache_ok;
+}
+
 static bool run_invalidation_scenario(
         ggml_backend_t cuda,
         ggml_backend_t cpu,
@@ -952,6 +1126,52 @@ static void * create_direct_session(
     return ggml_moe_cache.session_create(backends, 2);
 }
 
+static bool run_batch_clamp_liveness(
+        ggml_backend_t cuda, ggml_backend_t cpu, ggml_tensor * weights) {
+    if (!ggml_moe_cache.session_enter || !ggml_moe_cache.session_leave ||
+        !ggml_moe_cache.begin || !ggml_moe_cache.end ||
+        !ggml_moe_cache.session_destroy) {
+        fprintf(stderr, "cache-batch-clamp-liveness: incomplete cache API\n");
+        return false;
+    }
+
+    configure_cache(nullptr);
+    void * session = create_direct_session(cuda, cpu);
+    if (!session) {
+        fprintf(stderr, "cache-batch-clamp-liveness: failed to create session\n");
+        return false;
+    }
+
+    const size_t expert_size = ggml_nbytes(weights) / n_expert;
+    ggml_moe_cache.session_enter(session);
+    void * refused = ggml_moe_cache.begin(
+            "blk.0.ffn_up_exps.weight", weights->data, expert_size,
+            n_in, n_out, GGML_TYPE_Q4_0, n_expert, 2);
+    const bool refused_cleanly = refused == nullptr;
+    if (refused) {
+        ggml_moe_cache.end(refused);
+    }
+    void * admitted = ggml_moe_cache.begin(
+            "blk.0.ffn_up_exps.weight", weights->data, expert_size,
+            n_in, n_out, GGML_TYPE_Q4_0, n_expert, 1);
+    const bool admitted_after = admitted != nullptr;
+    if (admitted) {
+        ggml_moe_cache.end(admitted);
+    }
+    ggml_moe_cache.session_leave(session);
+    ggml_moe_cache.session_destroy(session);
+
+    const bool ok = refused_cleanly && admitted_after;
+    if (!ok) {
+        fprintf(stderr,
+                "cache-batch-clamp-liveness: refused=%s admitted-after=%s\n",
+                refused_cleanly ? "yes" : "no",
+                admitted_after ? "yes" : "no");
+    }
+    printf("cache-batch-clamp-liveness: %s\n", ok ? "OK" : "FAIL");
+    return ok;
+}
+
 static bool direct_begin_ready(
         const char * name, const void * base, size_t expert_size,
         int64_t direct_n_in, int64_t direct_n_out,
@@ -1391,6 +1611,15 @@ int main() {
 
     bool ok = true;
     ok &= run_scenario("cache-hit", nullptr, cuda, cpu, graph, reference, capture);
+    for (int tokens = 1; tokens <= 6; tokens++) {
+        ok &= run_batch_scenario(
+                cuda, cpu, weights, 10, tokens, -1, true, capture);
+    }
+    ok &= run_batch_scenario(
+            cuda, cpu, weights, 10, 6, 2, true, capture);
+    ok &= run_batch_scenario(
+            cuda, cpu, weights, 10, 7, -1, false, capture);
+    ok &= run_batch_clamp_liveness(cuda, cpu, weights);
     ok &= run_scenario("dispatch-fallback", "dispatch", cuda, cpu, graph, reference, capture);
     ok &= run_scenario("collect-fallback", "collect", cuda, cpu, graph, reference, capture);
     ok &= run_scenario("insert-fallback", "insert", cuda, cpu, graph, reference, capture);

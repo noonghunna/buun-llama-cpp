@@ -209,3 +209,43 @@ left in place. Recommended owner-run validation order remains:
 | Laguna residual-stream graph outputs for DFlash | registers every layer input in `t_layer_inp`, publishes the pre-final-norm `t_h_nextn` capture, and defers final output-row gathering when unmasked nextn extraction is enabled; this prevents the first reserve/decode graph from asserting on a null capture tensor and preserves every-token feature rows | ours (fork issue #4 round-4 repair; source parity with the working reference, device acceptance pending) |
 | Official-DFlash reinjection rewind | removes the stale speculative suffix from the drafter KV before target-conditioned encoder output is injected at the same positions; without the rewind, the batch allocator rejects the first verification-cycle injection as a non-consecutive position rewind | ours (fork issue #4 round-4 follow-up; device acceptance pending) |
 | Official-DFlash position lifecycle + trace diagnostics | rewinds the target-conditioned suffix again before steady-state re-drafting after partial acceptance, validates consecutive positions before both drafter decoder calls, logs KV min/max plus injection offset/token count at `-lv 4`, and replaces opaque decode failures with expected-vs-actual position diagnostics | ours (fork issue #4 round-5 repair; device acceptance pending) |
+
+## Sync-latency Stage 2 — speculative activation deduplication
+
+**Upstream status:** ours — issue #12; device validation pending.
+
+On top of `stack/sync-stage2`, branch `feat/spec-act-dedup` replaces
+per-hit activation staging with a token-minor rectangular grid. Real hits
+occupy `rank * n_tokens + token`;
+padding channels reuse an already pinned slot and are discarded during
+collection. The activation gather, upload, and q8_1 quantization now process
+`n_tokens` rows rather than `n_hits`, while the existing MMVQ fast-modulo
+channel mapping remains unchanged.
+
+The implementation stores the original output-row mapping in the existing
+64-entry node state and refuses any padded grid wider than 64 channels. The
+CPU hook also emits one warning on its first top-k × token-count refusal. No
+shared MMVQ kernel changed.
+
+The first device run exposed an invalid test oracle: CPU vec-dot and CUDA MMVQ
+are tolerance-equivalent, not byte-identical, including the one-token identity
+case where no padding exists. Batched hit tests now use the suite's established
+NMSE bound; dispatch/collect CPU-fallback tests remain byte-exact. The
+maintainer gate covers cache-off comparisons for token batches 1–6 at top-10,
+an empty-token hit pattern, and a top-10 × 7 clean-refusal case.
+
+The third device bounce exposed a separate refusal-diagnostic bug. The batch-7
+fixture computes its CPU reference outside a cache session; the process-global
+warning flag was consumed there even though the hook was inactive, so the real
+oversized scheduler run could not prove that it refused. Oversize reporting is
+now owned by the active cache session through a no-acquisition callback. The
+reference pass remains silent, and one warning is emitted by the active
+top-k × token refusal.
+
+A lifetime audit confirms that both size refusals precede resource ownership:
+the 64-row CPU guard does not call `begin`, while the CUDA `MAX_BATCH` clamp
+returns before device selection, pool discovery, active-source/node accounting,
+`dispatch_mu`, pins, or slot readers. A same-session regression now performs a
+rejected `MAX_BATCH + 1` begin immediately followed by an eligible begin; this
+detects any future clamp-path lease leak before the existing same-process
+batch-7 → fill-invalidate sequence.
