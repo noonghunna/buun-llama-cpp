@@ -111,11 +111,15 @@ void common_speculative_accept(common_speculative * spec, uint16_t n_accepted);
 void common_speculative_set_seq_id(common_speculative * spec, llama_seq_id seq_id);
 
 // fork: single-seq draft (returns tokens)
+// seq_id selects which drafter sequence this draft is written to. Callers sharing one
+// common_speculative across server slots (DRAFT_DFLASH) MUST pass the slot's own id —
+// passing a constant makes concurrent slots collide on one drafter sequence.
 llama_tokens common_speculative_draft(
         common_speculative              * spec,
         const common_params_speculative & params,
         const llama_tokens              & prompt_tgt,
         llama_token                       id_last,
+        llama_seq_id                      seq_id,
         std::vector<float>              * draft_log_probs = nullptr,
         llama_pos                         n_past_override = -1);
 

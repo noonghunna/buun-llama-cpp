@@ -4051,7 +4051,7 @@ private:
                     const llama_tokens & cached_text_tokens = slot.prompt.tokens.get_text_tokens();
                     const auto & params_spec = slot.task->params.speculative;
                     const llama_pos n_past = slot.prompt.tokens.pos_next();
-                    draft = common_speculative_draft(slot.get_spec(), params_spec, cached_text_tokens, slot.sampled, nullptr, n_past);
+                    draft = common_speculative_draft(slot.get_spec(), params_spec, cached_text_tokens, slot.sampled, slot.id, nullptr, n_past);
                 }
 
                 if (draft.size() > (size_t) n_draft_max) {
