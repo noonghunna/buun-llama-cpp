@@ -3308,14 +3308,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // paths — the sched retains the previous value across calls.
     if (cparams.cb_eval == dflash_eval_callback && dflash_capture) {
         const bool cb_dormant = dflash_capture->eval_callback_dormant();
-        // LOCAL PROBE (R5, disclosed): log dormancy transitions once, not per decode
-        static int last_dormant = -1;
-        if (last_dormant != (int) cb_dormant) {
-            LLAMA_LOG_INFO("%s: dflash eval-callback %s (chunked-sync path %s)\n", __func__,
-                    cb_dormant ? "DORMANT (null cb installed)" : "LIVE",
-                    cb_dormant ? "avoided" : "ACTIVE");
-            last_dormant = (int) cb_dormant;
-        }
         ggml_backend_sched_set_eval_callback(sched.get(),
                 cb_dormant ? nullptr : cparams.cb_eval,
                 cb_dormant ? nullptr : cparams.cb_eval_user_data);

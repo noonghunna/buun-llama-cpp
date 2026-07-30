@@ -1896,8 +1896,13 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
             const bool cd_passed  = arg_passed({"-cd", "--ctx-size-draft"});
 
             if (!cd_passed && params.speculative.draft.n_ctx == 0) {
-                LOG_INF("dflash: PROBE PATCH r11: leaving draft n_ctx=0 so server falls back to target n_ctx_seq (drafter tracks absolute positions; any fixed cap dies at depth)\n");
-                // params.speculative.draft.n_ctx stays 0 -> server-context.cpp:1645 target-n_ctx fallback
+                // Leave draft n_ctx at 0 so the server inherits the target's n_ctx_seq.
+                // Upstream defaults it to 256 here; the DFlash drafter tracks ABSOLUTE
+                // positions, so any fixed cap silently truncates drafting once the
+                // sequence passes it. Pass -cd N to set it explicitly.
+                LOG_INF("dflash: draft ctx unset — inheriting the target n_ctx_seq "
+                        "(the drafter tracks absolute positions, so a fixed cap would "
+                        "truncate at depth); pass -cd N to override\n");
             }
             bool capped = false;
             if (!b_passed && params.n_batch > 256) {
