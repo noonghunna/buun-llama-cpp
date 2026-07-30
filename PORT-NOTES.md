@@ -209,3 +209,52 @@ left in place. Recommended owner-run validation order remains:
 | Laguna residual-stream graph outputs for DFlash | registers every layer input in `t_layer_inp`, publishes the pre-final-norm `t_h_nextn` capture, and defers final output-row gathering when unmasked nextn extraction is enabled; this prevents the first reserve/decode graph from asserting on a null capture tensor and preserves every-token feature rows | ours (fork issue #4 round-4 repair; source parity with the working reference, device acceptance pending) |
 | Official-DFlash reinjection rewind | removes the stale speculative suffix from the drafter KV before target-conditioned encoder output is injected at the same positions; without the rewind, the batch allocator rejects the first verification-cycle injection as a non-consecutive position rewind | ours (fork issue #4 round-4 follow-up; device acceptance pending) |
 | Official-DFlash position lifecycle + trace diagnostics | rewinds the target-conditioned suffix again before steady-state re-drafting after partial acceptance, validates consecutive positions before both drafter decoder calls, logs KV min/max plus injection offset/token count at `-lv 4`, and replaces opaque decode failures with expected-vs-actual position diagnostics | ours (fork issue #4 round-5 repair; device acceptance pending) |
+
+---
+
+## Delta manifest — 2026-07-30 (`moe-cache-engine-v1`)
+
+Recorded late: these five deltas were authored during the engine-lock session and
+were **not** entered here at the time, which violates AGENTS.md rule 3 ("a delta
+without an upstream story is a defect of the delta"). Entered now, with the
+upstream story each one will need.
+
+Tag `moe-cache-engine-v1` = `43c43a5e8`. The tag predates this section; it is the
+validated engine snapshot, this is living documentation of it.
+
+### ⚠️ Attribution — read before opening any PR to buun
+
+**The MoE expert cache is [leloch](https://github.com/leloch/llama.cpp)'s work, not
+ours.** We ported it (see the Cherry-picks table above; the `-x` trailers carry the
+exact source hashes and the original author identity is preserved). Any upstream PR
+that carries the cache must either come from leloch or credit leloch explicitly and
+link `leloch:moe-cache-pr`. Our deltas below are ours; the substrate they sit on is
+not, and a PR that blurs that would be misattribution.
+
+### Our deltas
+
+| Delta | PR-unit branch | Why | Upstream status |
+|---|---|---|---|
+| `speculative: route single-seq draft to the caller's drafter sequence` | `fix/draft-dflash-seq-routing` (`66f9c7c55`) | `common_speculative_draft()` hard-coded `spec->dparams[0]`; contracts sharing one `common_speculative` across slots (DRAFT_DFLASH) had every slot draft into drafter sequence 0 — guaranteed KV-lineage collision at N>=2, taking down all in-flight slots | **ours — PR-ready to buun independently.** Touches buun's own DFlash contract, no moe-cache dependency. Highest-value single PR we hold. |
+| `server: honour --dflash-max-slots for the DRAFT_DFLASH contract` | `fix/draft-dflash-slot-cap` (`5c5449f9f`) | `dflash_slots_cap` is triple-purpose (slot cap, shared drafter-ctx creation, AND the gate for shared `spec` init). Naive gate widening disables speculation entirely; this adds a separate counter | **ours — PR-ready independently.** buun's server code. |
+| `cuda: warn when MAX_BATCH silently bypasses the MoE expert cache` | `fix/moe-cache-batch-bypass-warn` (`12be46004`) | Violating `MAX_BATCH >= n-max+1` makes the cache refuse every decode with no diagnostic — cost two runs read as -30% / -48% | **ours — BLOCKED on the cache landing upstream first.** Meaningless in a tree without moe-cache. |
+| `moe-cache: make the cache-off states impossible to miss` (C/D/E) | `fix/moe-cache-observability` (`bf3da5261`) | Bypass ceiling 32->128 (ngram drafters emit 48-64 token drafts, so the guard was blind to them); one-shot flag process-global -> per-session; "no cache budget" INFO -> WARN with remedy (it disables the cache entirely yet logged quieter than the partial bypass) | **ours — BLOCKED on the cache landing upstream first.** |
+| `clean the disclosed local probe patches out of the serving path` | `chore/drop-local-probe-patches` (`43c43a5e8`) | Split delta: **`common/arg.cpp`** removes upstream's hard 256-token DFlash draft-ctx default (the drafter tracks absolute positions, so a fixed cap truncates at depth) — that half is a real fix to buun's code. **`src/llama-context.cpp`** deletes our own R5 dormancy probe — nothing to upstream | **arg.cpp half: ours, PR-ready independently. llama-context half: local-only, nothing to send.** Split the commit before PRing. |
+
+### Held back deliberately
+
+| Item | Status |
+|---|---|
+| L2 `feat/spec-act-dedup` (`1f49319a4`) | **excluded from the tag.** Fails `cache-fill-invalidate` where base and L1+L3 pass (bisected 2026-07-30). Also measured ~10-14% slower. Do not upstream; do not fold into the engine until diagnosed. |
+
+### PR ordering when the time comes
+
+1. `fix/draft-dflash-seq-routing` — independent, and a crash fix. Send first.
+2. `fix/draft-dflash-slot-cap` — independent.
+3. `chore/drop-local-probe-patches`, **arg.cpp half only** — independent.
+4. The moe-cache port itself — **leloch's call / leloch's credit**.
+5. `fix/moe-cache-batch-bypass-warn` and `fix/moe-cache-observability` — only after (4).
+
+Maintainer decision 2026-07-30: nothing goes upstream until the moe-cache work has
+community validation, and we wait for buun to sync with mainline first (he is 108
+commits behind ggml-org as of 2026-07-30, last mainline merge ~2026-07-21).
