@@ -217,6 +217,9 @@ struct moe_cache_session {
     std::condition_variable idle_cv;
     std::atomic<bool> stopping{false};
     std::atomic<bool> dormant{false};
+    // Per-session so a second session in the same process still gets the diagnostic.
+    // A process-global one-shot silently swallowed it for every session after the first.
+    std::atomic<bool> warned_batch_bypass{false};
     bool announced = false;
     int active_scopes = 0;
     int active_nodes = 0;
@@ -811,8 +814,17 @@ static bool moe_cache_prepare_budget(
     device.budget_limit = available;
 
     if (available == 0) {
-        MOE_CACHE_LOG("[moe-cache] CUDA%d has no cache budget after %zu MiB reserve\n",
-                device.physical, session.config.reserve_mb);
+        // WARN, not INFO. This disables the expert cache ENTIRELY on this device, so it
+        // must not be quieter than the partial-bypass warning above. It emits no
+        // "bypassing cache" text either, so a bypass-only detector never sees it —
+        // measured 2026-07-30: two benchmark arms ran 12-22% slow with no pool ever
+        // allocated and reported healthy. Carry the remedy inline; do NOT refuse to
+        // start, which would break setups that work, just slower than the user believes.
+        GGML_LOG_WARN("[moe-cache] CUDA%d: NO CACHE BUDGET after %zu MiB reserve — the expert "
+                      "cache is DISABLED on this device and decode will run at no-cache "
+                      "speed. Lower the reserve (GGML_CUDA_MOE_CACHE_RESERVE_MB=1536), "
+                      "reduce context, or shrink the pool so it fits.\n",
+                      device.physical, session.config.reserve_mb);
         return false;
     }
     return true;
@@ -1330,13 +1342,16 @@ static void * moe_cache_begin(
     // Only decode-sized batches are worth reporting. Prefill is cache-blind BY DESIGN
     // (a 2048-token ubatch is always far over the clamp), so warning on every oversize
     // batch would fire on the first request of every run and train users to ignore it.
-    // MOE_CACHE_DECODE_BATCH_MAX bounds what can plausibly be a decode batch: top-k
-    // routing caps a usable batch near 6, and draft depth is single digits.
+    // MOE_CACHE_DECODE_BATCH_MAX bounds what can plausibly be a decode batch.
+    // Raised 32 -> 128 (2026-07-30): the model-free ngram drafters emit 48-64 token
+    // drafts by default (they size on `size-m`/`n-max`, which --draft-max does NOT
+    // clamp), so a 32 ceiling left the warning blind to exactly the drafter family
+    // most likely to trip the clamp. 128 still sits far below a 2048-token prefill
+    // ubatch, so prefill stays unreported.
     if (n_tokens > session->config.max_batch) {
-        constexpr int MOE_CACHE_DECODE_BATCH_MAX = 32;
+        constexpr int MOE_CACHE_DECODE_BATCH_MAX = 128;
         if (n_tokens <= MOE_CACHE_DECODE_BATCH_MAX) {
-            static std::atomic<bool> warned{false};
-            if (!warned.exchange(true)) {
+            if (!session->warned_batch_bypass.exchange(true)) {
                 GGML_LOG_WARN("[moe-cache] bypassing cache: decode batch of %d tokens exceeds "
                               "GGML_CUDA_MOE_CACHE_MAX_BATCH=%d — raise it to at least the "
                               "largest decode batch (with speculative decoding that is "
